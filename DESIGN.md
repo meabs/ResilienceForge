@@ -74,6 +74,8 @@ Resilience Forge treats architecture as a live test course. The catalogue is the
 
 The build combines racing-league telemetry with the discipline of a cutting bench: each state change leaves an observable mark, the topology stays central, and the forensic decision record is part of the interface rather than a hidden log. There is no assistant persona, conversation surface, or decorative dashboard wall.
 
+The architecture language is consistently Google Cloud. Every scenario is a GCP reference rather than a cloud-neutral sketch: Pub/Sub ordering keys anchor the checkout flow, Cloud Run and a global external Application Load Balancer define the regional pair, and Vertex AI endpoints define model rollout. Cloud SQL and Memorystore make the stateful edges explicit.
+
 **Key Characteristics:**
 
 - live topology canvas with state encoded by geometry, stroke, density, and color;

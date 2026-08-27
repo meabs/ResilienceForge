@@ -6,6 +6,7 @@ The build follows the project documents in the repository root:
 
 - three equal architecture references: event-driven checkout, multi-region SaaS, and LLM inference serving;
 - one catalogue route and one bench route with a shared in-memory state;
+- GCP-native reference components across every scenario: Pub/Sub, Cloud Run, Cloud SQL, Memorystore, Vertex AI, API Gateway, and a global external Application Load Balancer;
 - deterministic simulation, visible failure modes, operator pins, and a forensic decision record (FDR);
 - structured WebMCP tools that read and mutate the same state as the visible controls.
 
@@ -24,7 +25,7 @@ Open `http://localhost:3000/` and load a reference onto the bench. To exercise t
 4. Ask an external browser agent to read state, attempt a remediation, and recover from the expected `STALE_STATE` response.
 5. Add a constraint pin, repeat the test, and verify the legal remediation set changes.
 
-The scenario model is intentionally deterministic and uses public list-price estimates. It is a competition demonstration, not production capacity planning. No live provider pricing or infrastructure APIs are required.
+The scenario model is intentionally deterministic and uses public list-price estimates. It is a competition demonstration, not production capacity planning. No live provider pricing or infrastructure APIs are required. The topology vocabulary follows Google Cloud patterns: ordering-key delivery in Pub/Sub, multi-region Cloud Run behind a global external Application Load Balancer, Cloud SQL cross-region replication, and Vertex AI endpoint traffic splits.
 
 ## Build
 

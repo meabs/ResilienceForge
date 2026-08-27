@@ -25,7 +25,7 @@ import {
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
 
 type Source = 'ui' | 'webmcp' | 'sim';
-type FifoMode = 'standard' | 'high_throughput';
+type PubSubMode = 'standard' | 'high_throughput';
 
 interface NodeMetric {
   demandRps: number;
@@ -76,8 +76,8 @@ interface State {
   pins: PinId[];
   running: boolean;
   stressActive: boolean;
-  fifoMode: FifoMode;
-  fifoBatch: number;
+  pubsubMode: PubSubMode;
+  pubsubBatch: number;
   regionPrimaryPercent: number;
   modelNewPercent: number;
   failedRegions: Region[];
@@ -153,8 +153,8 @@ function createInitialState(architecture: ArchitectureDefinition): State {
     pins: [],
     running: false,
     stressActive: false,
-    fifoMode: 'standard' as FifoMode,
-    fifoBatch: 1,
+    pubsubMode: 'standard' as PubSubMode,
+    pubsubBatch: 1,
     regionPrimaryPercent: 50,
     modelNewPercent: 20,
     failedRegions: [],
@@ -242,22 +242,22 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     let overflowRps = 0;
     let ttftMs: number | undefined;
 
-    if (architecture.id === 'event_driven_checkout' && node.id === 'sqs_fifo') {
-      const unit = state.fifoMode === 'standard' ? 300 : 4500;
-      capacity = Math.min(unit * state.fifoBatch, state.fifoMode === 'standard' ? 3000 : 45000);
+    if (architecture.id === 'event_driven_checkout' && node.id === 'pubsub_ordered') {
+      const unit = state.pubsubMode === 'standard' ? 300 : 4500;
+      capacity = Math.min(unit * state.pubsubBatch, state.pubsubMode === 'standard' ? 3000 : 45000);
       if (state.stressActive) {
         served = Math.min(demand, capacity);
         overflowRps = Math.max(0, demand - served);
         queueDepth = Math.round(overflowRps * (state.tick + 1) * 0.45);
         if (overflowRps > 0) {
-          breachReasons.push('FIFO CAPACITY');
+          breachReasons.push('PUB/SUB CAPACITY');
           p95Ms = Math.max(p95Ms, Math.round(220 + (overflowRps / Math.max(demand, 1)) * 1100));
         }
       }
-      cost += state.fifoMode === 'high_throughput' ? 650 : 0;
+      cost += state.pubsubMode === 'high_throughput' ? 650 : 0;
     }
 
-    if (architecture.id === 'event_driven_checkout' && node.id === 'postgres_primary' && health === 'down') {
+    if (architecture.id === 'event_driven_checkout' && node.id === 'cloud_sql' && health === 'down') {
       if (state.readReplicaAdded) {
         capacity = 8000;
       } else if (state.stressActive) {
@@ -267,7 +267,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     }
 
     if (architecture.id === 'multi_region_saas') {
-      const isPrimary = node.region === 'eu-west-2';
+      const isPrimary = node.region === 'europe-west2';
       const assignedShare = isPrimary ? state.regionPrimaryPercent / 100 : 1 - state.regionPrimaryPercent / 100;
       demand = state.peakRps * assignedShare;
       if (state.stressActive || state.failedRegions.length > 0) {
@@ -282,8 +282,8 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       if (health === 'down') served = 0;
     }
 
-    if (architecture.id === 'llm_inference_serving' && (node.id === 'gpu_old' || node.id === 'gpu_new')) {
-      const isNew = node.id === 'gpu_new';
+    if (architecture.id === 'llm_inference_serving' && (node.id === 'vertex_stable' || node.id === 'vertex_rc')) {
+      const isNew = node.id === 'vertex_rc';
       const share = isNew ? state.modelNewPercent / 100 : 1 - state.modelNewPercent / 100;
       demand = state.peakRps * share;
       const batch = state.batching[node.id]?.maxBatch ?? 1;
@@ -294,12 +294,12 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
         const utilisation = demand / Math.max(capacity, 1);
         ttftMs = utilisation < 0.7 ? 350 : utilisation <= 0.9 ? 700 : utilisation <= 1 ? 1500 : 3000;
         if (state.batching[node.id]) ttftMs += state.batching[node.id].waitMs;
-        if (isNew && overflowRps > 0) breachReasons.push('NEW GPU OVERFLOW');
+        if (isNew && overflowRps > 0) breachReasons.push('VERTEX AI OVERFLOW');
         p95Ms = Math.max(p95Ms, ttftMs);
       } else {
         ttftMs = 350;
       }
-      if (isNew && state.modelNewPercent > 55 && state.stressActive) breachReasons.push('RELEASE GPU SATURATED');
+      if (isNew && state.modelNewPercent > 55 && state.stressActive) breachReasons.push('RELEASE ENDPOINT SATURATED');
     }
 
     if (health === 'down') served = 0;
@@ -322,8 +322,8 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   }
 
   if (architecture.id === 'event_driven_checkout') {
-    const queue = nodeMetrics.sqs_fifo;
-    const db = nodeMetrics.postgres_primary;
+    const queue = nodeMetrics.pubsub_ordered;
+    const db = nodeMetrics.cloud_sql;
     rpsAchieved = Math.min(queue?.servedRps ?? state.peakRps, db?.servedRps ?? state.peakRps);
     if (state.stressActive && queue?.overflowRps) {
       availability = rpsAchieved / Math.max(state.peakRps, 1);
@@ -334,8 +334,8 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       errorRate = 1 - availability;
     }
   } else if (architecture.id === 'multi_region_saas') {
-    const regionA = nodeMetrics.app_a;
-    const regionB = nodeMetrics.app_b;
+    const regionA = nodeMetrics.app_europe;
+    const regionB = nodeMetrics.app_us;
     rpsAchieved = (regionA?.servedRps ?? 0) + (regionB?.servedRps ?? 0);
     if (state.stressActive || state.failedRegions.length > 0) {
       availability = rpsAchieved / Math.max(state.peakRps, 1);
@@ -344,15 +344,15 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       p95Ms = maxUtil > 1 ? 860 : maxUtil > 0.9 ? 560 : 260;
     }
   } else {
-    const oldPool = nodeMetrics.gpu_old;
-    const newPool = nodeMetrics.gpu_new;
+    const oldPool = nodeMetrics.vertex_stable;
+    const newPool = nodeMetrics.vertex_rc;
     rpsAchieved = (oldPool?.servedRps ?? 0) + (newPool?.servedRps ?? 0);
     if (state.stressActive) {
       availability = rpsAchieved / Math.max(state.peakRps, 1);
       errorRate = 1 - availability;
       p95Ms = Math.max(oldPool?.ttftMs ?? 350, newPool?.ttftMs ?? 350);
     }
-    cost += (state.batching.gpu_new?.maxBatch ?? 1) > 1 ? 560 : 0;
+    cost += (state.batching.vertex_rc?.maxBatch ?? 1) > 1 ? 560 : 0;
   }
 
   if (state.failedRegions.length > 0 && architecture.id === 'multi_region_saas') {
@@ -475,7 +475,7 @@ function readResult(current: State, source: Source, op: string, args: Record<str
 
 function pinLabel(pin: PinId) {
   return {
-    keep_fifo_ordering: 'Keep FIFO ordering',
+    keep_pubsub_ordering: 'Keep Pub/Sub ordering keys',
     no_second_region: 'No second region',
     keep_old_model: 'Keep old model',
     budget_hard: 'Budget hard',
@@ -501,6 +501,7 @@ function makeTools(
         const state = getState();
         const result = read('get_architecture', {}, {
           architectureId: architecture.id,
+          platform: architecture.platform,
           nodes: architecture.nodes.map((node) => ({
             id: node.id,
             name: node.name,
@@ -511,7 +512,7 @@ function makeTools(
           edges: architecture.edges,
           failedRegions: state.failedRegions,
           failedZones: state.failedZones,
-          excludedRegions: state.pins.includes('no_second_region') ? ['us-east-1'] : [],
+          excludedRegions: state.pins.includes('no_second_region') ? ['us-east4'] : [],
           storeVersion: state.version,
         });
         return result;
@@ -525,6 +526,7 @@ function makeTools(
         const state = getState();
         return read('get_scenario', {}, {
           architectureId: architecture.id,
+          platform: architecture.platform,
           peakRps: state.peakRps,
           budgetGbp: state.budget,
           availabilityTarget: state.availabilityTarget,
@@ -564,15 +566,16 @@ function makeTools(
       description: 'Read applicable provider-limit and model-assumption records with source dates and provenance.',
       inputSchema: toolInputSchema({}),
       execute: () => read('get_constraints', {}, {
+        provider: architecture.platform,
         constraints: architecture.id === 'event_driven_checkout'
           ? [
-              { id: 'sqs-fifo-standard-unbatched', sourceType: 'model_assumption', metric: 'FIFO operations', value: 300, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Curated London bench model.' },
-              { id: 'sqs-fifo-high-throughput-unbatched', sourceType: 'model_assumption', metric: 'FIFO operations', value: 4500, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Curated London bench model.' },
+              { id: 'pubsub-ordered-key-standard', sourceType: 'model_assumption', metric: 'Pub/Sub ordered delivery', value: 300, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model.' },
+              { id: 'pubsub-ordered-key-high-throughput', sourceType: 'model_assumption', metric: 'Pub/Sub ordered delivery', value: 4500, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model.' },
             ]
           : architecture.id === 'llm_inference_serving'
             ? [
-                { id: 'gpu-old-capacity', sourceType: 'model_assumption', metric: 'stable model capacity', value: 120, unit: 'inference/s/replica', sourceDate: '2026-08-27' },
-                { id: 'gpu-new-capacity', sourceType: 'model_assumption', metric: 'release candidate capacity', value: 80, unit: 'inference/s/replica', sourceDate: '2026-08-27' },
+                { id: 'vertex-ai-stable-capacity', sourceType: 'model_assumption', metric: 'Vertex AI stable endpoint capacity', value: 120, unit: 'inference/s/replica', sourceDate: '2026-08-27' },
+                { id: 'vertex-ai-release-capacity', sourceType: 'model_assumption', metric: 'Vertex AI release endpoint capacity', value: 80, unit: 'inference/s/replica', sourceDate: '2026-08-27' },
               ]
             : [{ id: 'regional-capacity', sourceType: 'model_assumption', metric: 'app capacity', value: 1900, unit: 'requests/s/replica', sourceDate: '2026-08-27' }],
         publicListPriceEstimate: { gbpMonth: stateFor(getState()).sim.costGbpMonth, sourceDate: '2026-08-27', assumptions: ['Curated estimate', 'Synthetic replica mix'] },
@@ -597,7 +600,7 @@ function makeTools(
     tools.push(
       {
         name: 'fail_zone',
-        description: 'Fail a zonal runtime slice without deleting its reference nodes.',
+        description: 'Fail a zonal data-plane slice without deleting its managed-service reference nodes.',
         inputSchema: toolInputSchema({ zone: { type: 'string', enum: ['a', 'b'] }, expectedVersion: { type: 'number' } }, ['zone', 'expectedVersion']),
         execute: (input) => invoke('fail_zone', { zone: String(input.zone) }, Number(input.expectedVersion)),
       },
@@ -609,19 +612,19 @@ function makeTools(
       },
       {
         name: 'enable_high_throughput',
-        description: 'Enable high-throughput FIFO mode while retaining ordered semantics.',
+        description: 'Enable the higher-throughput Pub/Sub ordering-key mode while retaining ordered semantics.',
         inputSchema: toolInputSchema({ id: { type: 'string' }, enabled: { type: 'boolean' }, expectedVersion: { type: 'number' } }, ['id', 'enabled', 'expectedVersion']),
         execute: (input) => invoke('enable_high_throughput', { id: String(input.id), enabled: Boolean(input.enabled) }, Number(input.expectedVersion)),
       },
       {
         name: 'set_batching',
-        description: 'Configure FIFO batching within the declared model limits.',
+        description: 'Configure Pub/Sub batching within the declared GCP model limits.',
         inputSchema: toolInputSchema({ id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'maxBatch', 'waitMs', 'expectedVersion']),
         execute: (input) => invoke('set_batching', { id: String(input.id), maxBatch: Number(input.maxBatch), waitMs: Number(input.waitMs) }, Number(input.expectedVersion)),
       },
       {
         name: 'add_read_replica',
-        description: 'Add a same-region read replica for the zonal failure path.',
+        description: 'Add a same-region Cloud SQL read replica for the zonal failure path.',
         inputSchema: toolInputSchema({ id: { type: 'string' }, expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
         execute: (input) => invoke('add_read_replica', { id: String(input.id) }, Number(input.expectedVersion)),
       },
@@ -633,7 +636,7 @@ function makeTools(
       {
         name: 'fail_region',
         description: 'Fail one configured region while keeping its reference topology visible.',
-        inputSchema: toolInputSchema({ region: { type: 'string', enum: ['eu-west-2', 'us-east-1'] }, expectedVersion: { type: 'number' } }, ['region', 'expectedVersion']),
+        inputSchema: toolInputSchema({ region: { type: 'string', enum: ['europe-west2', 'us-east4'] }, expectedVersion: { type: 'number' } }, ['region', 'expectedVersion']),
         execute: (input) => invoke('fail_region', { region: String(input.region) }, Number(input.expectedVersion)),
       },
       {
@@ -644,7 +647,7 @@ function makeTools(
       },
       {
         name: 'set_autoscaling',
-        description: 'Scale a surviving regional gateway or app within the reference.',
+        description: 'Scale a surviving regional Cloud Run service within the reference.',
         inputSchema: toolInputSchema({ id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
         execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
       },
@@ -661,13 +664,13 @@ function makeTools(
       },
       {
         name: 'set_autoscaling',
-        description: 'Scale one of the GPU pools within the reference.',
+        description: 'Scale one of the Vertex AI serving endpoints within the reference.',
         inputSchema: toolInputSchema({ id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
         execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
       },
       {
         name: 'set_batching',
-        description: 'Configure deterministic GPU batching and wait time.',
+        description: 'Configure deterministic Vertex AI batching and wait time.',
         inputSchema: toolInputSchema({ id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'maxBatch', 'waitMs', 'expectedVersion']),
         execute: (input) => invoke('set_batching', { id: String(input.id), maxBatch: Number(input.maxBatch), waitMs: Number(input.waitMs) }, Number(input.expectedVersion)),
       },
@@ -692,7 +695,7 @@ function runCommandFor(
     if (op === 'run_stress_test') {
       if (state.running) return { state, result: { ok: false, code: 'ALREADY_RUNNING', currentVersion: state.version } };
       const next = { ...state, running: true, stressActive: true };
-      if (architecture.id === 'multi_region_saas' && state.failedRegions.length === 0) next.failedRegions = ['us-east-1'];
+      if (architecture.id === 'multi_region_saas' && state.failedRegions.length === 0) next.failedRegions = ['us-east4'];
       if (architecture.id === 'llm_inference_serving') next.modelNewPercent = Math.max(next.modelNewPercent, 80);
       return { state: applyMetrics(next, architecture), result: {} };
     }
@@ -725,7 +728,7 @@ function runCommandFor(
     }
     if (op === 'fail_region') {
       const region = args.region as Region;
-      if (state.pins.includes('no_second_region') && region === 'us-east-1') return { state, result: { ok: false, code: 'PINNED_NO_SECOND_REGION', message: 'Secondary region is already excluded by a pinned human constraint.' } };
+      if (state.pins.includes('no_second_region') && region === 'us-east4') return { state, result: { ok: false, code: 'PINNED_NO_SECOND_REGION', message: 'Secondary region is already excluded by a pinned human constraint.' } };
       return { state: applyMetrics({ ...state, failedRegions: Array.from(new Set([...state.failedRegions, region])), running: true, stressActive: true }, architecture), result: { region } };
     }
     if (op === 'fail_zone') {
@@ -743,16 +746,16 @@ function runCommandFor(
     }
     if (op === 'enable_high_throughput') {
       const id = String(args.id);
-      if (id !== 'sqs_fifo') return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'High-throughput mode is only legal for the FIFO queue.' } };
-      const fifoMode = Boolean(args.enabled) ? 'high_throughput' : 'standard';
-      return { state: applyMetrics({ ...state, fifoMode }, architecture), result: { fifoMode } };
+      if (id !== 'pubsub_ordered') return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'High-throughput mode is only legal for the ordered Pub/Sub subscription.' } };
+      const pubsubMode = Boolean(args.enabled) ? 'high_throughput' : 'standard';
+      return { state: applyMetrics({ ...state, pubsubMode }, architecture), result: { pubsubMode } };
     }
     if (op === 'set_batching') {
       const id = String(args.id);
       const maxBatch = Math.min(10, Math.max(1, Math.round(Number(args.maxBatch))));
       const waitMs = Math.min(100, Math.max(0, Math.round(Number(args.waitMs))));
       if (!architecture.nodes.some((node) => node.id === id)) return { state, result: { ok: false, code: 'UNKNOWN_NODE', message: `Unknown node ${id}.` } };
-      return { state: applyMetrics({ ...state, fifoBatch: id === 'sqs_fifo' ? maxBatch : state.fifoBatch, batching: { ...state.batching, [id]: { maxBatch, waitMs } } }, architecture), result: { id, maxBatch, waitMs } };
+      return { state: applyMetrics({ ...state, pubsubBatch: id === 'pubsub_ordered' ? maxBatch : state.pubsubBatch, batching: { ...state.batching, [id]: { maxBatch, waitMs } } }, architecture), result: { id, maxBatch, waitMs } };
     }
     if (op === 'add_read_replica') {
       if (state.pins.includes('no_second_region')) return { state, result: {} };
@@ -823,7 +826,7 @@ function CatalogueView() {
 
       <section className="catalogue-hero">
         <div className="hero-copy">
-          <p className="eyebrow">CATALOGUE / THREE REFERENCES / ONE LIVE TRUTH</p>
+          <p className="eyebrow">CATALOGUE / GCP REFERENCES / ONE LIVE TRUTH</p>
           <h1>Pick a reference.<br /><span>Stress the truth.</span></h1>
           <p className="hero-description">Choose a known architecture, load it onto the bench, and make its trade-offs visible before implementation. A browser agent can operate the tools once you decide what the system is allowed to be.</p>
         </div>
@@ -838,7 +841,7 @@ function CatalogueView() {
       <section className="catalogue-grid" aria-label="Reference architectures">
         {architectures.map((architecture) => (
           <article className={`reference-card ${accentClass[architecture.accent]}`} key={architecture.id}>
-            <div className="card-topline"><span className="card-type">REFERENCE / {architecture.scenarioLabel}</span><span className="card-index" aria-hidden="true">{architecture.id === 'event_driven_checkout' ? 'A' : architecture.id === 'multi_region_saas' ? 'B' : 'C'}</span></div>
+            <div className="card-topline"><span className="card-type">{architecture.platform} REFERENCE / {architecture.scenarioLabel}</span><span className="card-index" aria-hidden="true">{architecture.id === 'event_driven_checkout' ? 'A' : architecture.id === 'multi_region_saas' ? 'B' : 'C'}</span></div>
             <TopologyThumbnail architecture={architecture} />
             <div className="reference-card-body">
               <h2>{architecture.name}</h2>
@@ -872,7 +875,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
   return (
     <div className={`graph-board ${architecture.id}`}>
       <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
-      {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('eu-west-2') ? 'failed' : ''}`}><span>EU-WEST-2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east-1') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST-1 / SECONDARY</span></div></>}
+      {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
       <svg className="graph-edges" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
         <defs><marker id="edge-arrow" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" /></marker></defs>
         {architecture.edges.map((edge) => {
@@ -918,7 +921,7 @@ function MetricStrip({ state, architecture }: { state: State; architecture: Arch
   const metrics = [
     { label: 'Availability', value: state.stressActive ? formatPercent(state.sim.availability, 2) : '—', status: state.sim.availability >= state.availabilityTarget ? 'good' : state.stressActive ? 'bad' : 'neutral' },
     { label: architecture.id === 'llm_inference_serving' ? 'TTFT' : 'P95 latency', value: state.stressActive ? `${formatNumber(state.sim.p95Ms)} ms` : '—', status: state.sim.p95Ms <= state.latencyTarget && state.stressActive ? 'good' : state.stressActive ? 'bad' : 'neutral' },
-    { label: architecture.id === 'llm_inference_serving' ? 'Overflow' : 'Error rate', value: architecture.id === 'llm_inference_serving' ? `${formatNumber(state.nodeMetrics.gpu_new?.overflowRps ?? 0)} /s` : state.stressActive ? formatPercent(state.sim.errorRate, 1) : '—', status: state.sim.errorRate === 0 && state.stressActive ? 'good' : state.stressActive ? 'bad' : 'neutral' },
+    { label: architecture.id === 'llm_inference_serving' ? 'Overflow' : 'Error rate', value: architecture.id === 'llm_inference_serving' ? `${formatNumber(state.nodeMetrics.vertex_rc?.overflowRps ?? 0)} /s` : state.stressActive ? formatPercent(state.sim.errorRate, 1) : '—', status: state.sim.errorRate === 0 && state.stressActive ? 'good' : state.stressActive ? 'bad' : 'neutral' },
     { label: 'Achieved RPS', value: state.stressActive ? formatNumber(state.sim.rpsAchieved) : '—', status: 'neutral' },
     { label: 'Public list-price estimate', value: `£${formatNumber(state.sim.costGbpMonth)}`, status: state.sim.costGbpMonth <= state.budget ? 'good' : 'bad' },
     { label: 'SLO', value: state.sim.sloPass ? 'PASS' : state.stressActive ? 'FAIL' : 'NOT TESTED', status: state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral' },
@@ -931,13 +934,13 @@ function RangeControl({ label, value, min, max, step, suffix, onChange }: { labe
 }
 
 function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { architecture: ArchitectureDefinition; state: State; toolStatus: 'off' | 'green' | 'amber' | 'red'; toolCount: number; invoke: (op: string, args: Record<string, unknown>) => DomainResult }) {
-  const stressLabel = architecture.id === 'event_driven_checkout' ? 'Run FIFO stress' : architecture.id === 'multi_region_saas' ? 'Fail us-east-1' : 'Ramp new model';
+  const stressLabel = architecture.id === 'event_driven_checkout' ? 'Run Pub/Sub stress' : architecture.id === 'multi_region_saas' ? 'Fail us-east4' : 'Ramp Vertex AI endpoint';
   const scenarioMetric = architecture.id === 'event_driven_checkout'
-    ? { label: 'Queue pressure', value: `${formatNumber(state.nodeMetrics.sqs_fifo?.queueDepth ?? 0)} depth`, note: `${formatNumber(state.nodeMetrics.sqs_fifo?.capacity ?? 0)} msg/s cap` }
+    ? { label: 'Ordering-key pressure', value: `${formatNumber(state.nodeMetrics.pubsub_ordered?.queueDepth ?? 0)} depth`, note: `${formatNumber(state.nodeMetrics.pubsub_ordered?.capacity ?? 0)} msg/s cap` }
     : architecture.id === 'multi_region_saas'
       ? { label: 'Traffic split', value: `${state.regionPrimaryPercent} / ${100 - state.regionPrimaryPercent}`, note: 'primary / secondary' }
-      : { label: 'New GPU', value: `${formatNumber((state.nodeMetrics.gpu_new?.utilisation ?? 0) * 100, 0)}% util`, note: `${formatNumber(state.nodeMetrics.gpu_new?.ttftMs ?? 350)} ms TTFT` };
-  const pins: PinId[] = architecture.id === 'event_driven_checkout' ? ['keep_fifo_ordering', 'budget_hard'] : architecture.id === 'multi_region_saas' ? ['no_second_region', 'budget_hard'] : ['keep_old_model', 'budget_hard'];
+      : { label: 'Release endpoint', value: `${formatNumber((state.nodeMetrics.vertex_rc?.utilisation ?? 0) * 100, 0)}% util`, note: `${formatNumber(state.nodeMetrics.vertex_rc?.ttftMs ?? 350)} ms TTFT` };
+  const pins: PinId[] = architecture.id === 'event_driven_checkout' ? ['keep_pubsub_ordering', 'budget_hard'] : architecture.id === 'multi_region_saas' ? ['no_second_region', 'budget_hard'] : ['keep_old_model', 'budget_hard'];
   return (
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
@@ -999,7 +1002,8 @@ function BenchView({ architectureId }: { architectureId: string }) {
       const raw = localStorage.getItem(`resilience-forge:controls:${architecture.id}`);
       if (!raw) return;
       const saved = JSON.parse(raw) as Partial<State>;
-      const next = applyMetrics({ ...stateRef.current, peakRps: saved.peakRps ?? stateRef.current.peakRps, budget: saved.budget ?? stateRef.current.budget, regionPrimaryPercent: saved.regionPrimaryPercent ?? stateRef.current.regionPrimaryPercent, modelNewPercent: saved.modelNewPercent ?? stateRef.current.modelNewPercent, pins: saved.pins ?? stateRef.current.pins }, architecture);
+      const savedPins = (saved.pins ?? []).map((pin) => pin === ('keep_fifo_ordering' as PinId) ? 'keep_pubsub_ordering' : pin);
+      const next = applyMetrics({ ...stateRef.current, peakRps: saved.peakRps ?? stateRef.current.peakRps, budget: saved.budget ?? stateRef.current.budget, regionPrimaryPercent: saved.regionPrimaryPercent ?? stateRef.current.regionPrimaryPercent, modelNewPercent: saved.modelNewPercent ?? stateRef.current.modelNewPercent, pins: savedPins }, architecture);
       commit(next);
     } catch {
       // Ignore malformed local preferences.
@@ -1043,9 +1047,9 @@ function BenchView({ architectureId }: { architectureId: string }) {
   const selectedNode = useMemo(() => architecture.nodes.find((node) => node.id === selectedNodeId), [architecture.nodes, selectedNodeId]);
   return (
     <main className="app-shell bench-shell">
-      <header className="topbar bench-topbar"><a href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</a><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>{architecture.name.toUpperCase()} / LIVE BENCH</small></span></div><div className="topbar-status"><span className="version-readout">SHARED STATE / v{state.version}</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div></header>
+      <header className="topbar bench-topbar"><a href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</a><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>{architecture.platform} / {architecture.name.toUpperCase()} / LIVE BENCH</small></span></div><div className="topbar-status"><span className="version-readout">SHARED STATE / v{state.version}</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div></header>
       <div className="bench-layout">
-        <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} /></div><MetricStrip state={state} architecture={architecture} /><div className="proof-band"><div><strong>One bench. Two operators. No silent overwrite.</strong><p>Change a normal control while tools are active. The version moves, the stale write is rejected, and the next legal move has to read the new state.</p></div><div className="proof-mark"><span className="proof-square" /><span>live controls stay open</span></div></div></section>
+        <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.platform} / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>{architecture.platform} REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} /></div><MetricStrip state={state} architecture={architecture} /><div className="proof-band"><div><strong>One bench. Two operators. No silent overwrite.</strong><p>Change a normal control while tools are active. The version moves, the stale write is rejected, and the next legal move has to read the new state.</p></div><div className="proof-mark"><span className="proof-square" /><span>live controls stay open</span></div></div></section>
         <ScenarioRail architecture={architecture} state={state} toolStatus={toolStatus} toolCount={toolCount} invoke={invoke} />
       </div>
       <FdrTicker entries={state.log} />
