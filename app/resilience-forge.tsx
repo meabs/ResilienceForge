@@ -1,5 +1,8 @@
 'use client';
 
+/* Native anchors are intentional: the Sites Vinext runtime's Link prefetch path breaks internal navigation. */
+/* eslint-disable @next/next/no-html-link-for-pages */
+
 import {
   useCallback,
   useEffect,
@@ -8,7 +11,6 @@ import {
   useState,
   type CSSProperties,
 } from 'react';
-import Link from 'next/link';
 import {
   architectures,
   getArchitecture,
@@ -815,7 +817,7 @@ function CatalogueView() {
   return (
     <main className="app-shell catalogue-shell">
       <header className="topbar">
-      <Link href="/" className="brand-lockup" aria-label="Resilience Forge Catalogue"><BrandMark /><span><b>RESILIENCE FORGE</b><small>REFERENCE ARCHITECTURE BENCH</small></span></Link>
+      <a href="/" className="brand-lockup" aria-label="Resilience Forge Catalogue"><BrandMark /><span><b>RESILIENCE FORGE</b><small>REFERENCE ARCHITECTURE BENCH</small></span></a>
         <div className="topbar-status"><span className="topbar-note">human selects the reference</span><SiteToolsLamp status="off" /></div>
       </header>
 
@@ -846,7 +848,7 @@ function CatalogueView() {
                 <div><dt>Distinctive failure</dt><dd>{architecture.failure}</dd></div>
                 <div><dt>Human interrupt</dt><dd>{architecture.interrupt}</dd></div>
               </dl>
-              <Link className="load-button" href={`/bench/${architecture.id}`}><span>Load onto bench</span><span className="button-mark" aria-hidden="true" /></Link>
+              <a className="load-button" href={`/bench/${architecture.id}`}><span>Load onto bench</span><span className="button-mark" aria-hidden="true" /></a>
             </div>
           </article>
         ))}
@@ -1041,7 +1043,7 @@ function BenchView({ architectureId }: { architectureId: string }) {
   const selectedNode = useMemo(() => architecture.nodes.find((node) => node.id === selectedNodeId), [architecture.nodes, selectedNodeId]);
   return (
     <main className="app-shell bench-shell">
-      <header className="topbar bench-topbar"><Link href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</Link><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>{architecture.name.toUpperCase()} / LIVE BENCH</small></span></div><div className="topbar-status"><span className="version-readout">SHARED STATE / v{state.version}</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div></header>
+      <header className="topbar bench-topbar"><a href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</a><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>{architecture.name.toUpperCase()} / LIVE BENCH</small></span></div><div className="topbar-status"><span className="version-readout">SHARED STATE / v{state.version}</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div></header>
       <div className="bench-layout">
         <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} /></div><MetricStrip state={state} architecture={architecture} /><div className="proof-band"><div><strong>One bench. Two operators. No silent overwrite.</strong><p>Change a normal control while tools are active. The version moves, the stale write is rejected, and the next legal move has to read the new state.</p></div><div className="proof-mark"><span className="proof-square" /><span>live controls stay open</span></div></div></section>
         <ScenarioRail architecture={architecture} state={state} toolStatus={toolStatus} toolCount={toolCount} invoke={invoke} />
