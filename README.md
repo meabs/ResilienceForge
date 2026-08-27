@@ -6,7 +6,14 @@ Resilience Forge is a shared human-and-browser-agent operations bench for testin
 - **Public source:** [github.com/meabs/ResilienceForge](https://github.com/meabs/ResilienceForge)
 - **License:** [MIT](./LICENSE)
 
-The build follows the project documents in the repository root:
+The build follows the project documents in this repository:
+
+- [BUILD-SPEC.md](./BUILD-SPEC.md) — agent build specification and competition demo script
+- [TEST-ACCEPTANCE.md](./TEST-ACCEPTANCE.md) — acceptance criteria and video checklist
+- [PRODUCT.md](./PRODUCT.md) — product definition and positioning
+- [docs/](./docs/) — hero screenshots for judges and Devpost gallery
+
+Product surface:
 
 - three equal architecture references: event-driven checkout, multi-region SaaS, and LLM inference serving;
 - one catalogue route and one bench route with a shared in-memory state;
@@ -63,6 +70,7 @@ Each `tool` contains the required `name`, `description`, `inputSchema`, and `exe
 ### Common tools (all architectures)
 
 ```ts
+document.modelContext.registerTool({ name: 'get_bench_guide', description: 'Read the signature human-agent loop, valid remediation paths, pin semantics, and error codes for this bench.', inputSchema: {}, execute: async (input) => read('get_bench_guide', input) });
 document.modelContext.registerTool({ name: 'get_architecture', description: 'Read the current semantic topology, health, failures, exclusions, and store version.', inputSchema: {}, execute: async (input) => read('get_architecture', input) });
 document.modelContext.registerTool({ name: 'get_scenario', description: 'Read current human scenario controls, targets, pins, and store version.', inputSchema: {}, execute: async (input) => read('get_scenario', input) });
 document.modelContext.registerTool({ name: 'get_live_metrics', description: 'Read demand, served throughput, capacity, utilisation, headroom, queue or overflow, TTFT, and factual observations.', inputSchema: {}, execute: async (input) => read('get_live_metrics', input) });

@@ -615,6 +615,91 @@ function toolInputSchema(properties: Record<string, unknown>, required: string[]
   return { type: 'object', properties, required, additionalProperties: false };
 }
 
+function nodeIdProperty(architecture: ArchitectureDefinition) {
+  return { type: 'string', enum: architecture.nodes.map((node) => node.id) };
+}
+
+function benchGuideFor(architecture: ArchitectureDefinition) {
+  const common = {
+    signatureLoop: [
+      'Human selects reference from Catalogue — no WebMCP tool can load a reference.',
+      'Human configures scenario controls and pins on the Bench.',
+      'Agent discovers site tools, reads semantic state, runs stress or failure.',
+      'Agent begins legal remediation with expectedVersion from the latest read.',
+      'Human may change ordinary controls at any time while the agent is operating.',
+      'Stale agent mutations return STALE_STATE; agent re-reads and adapts.',
+    ],
+    errorCodes: {
+      STALE_STATE: 'Mutation used an outdated expectedVersion after human or simulation changed state.',
+      PINNED_NO_SECOND_REGION: 'Traffic to secondary region blocked while no_second_region pin is active.',
+      PINNED_KEEP_OLD_MODEL: '100% new-model split blocked while keep_old_model pin is active.',
+      PINNED_KEEP_PUBSUB_ORDERING: 'Unordered replacement blocked while keep_pubsub_ordering pin is active.',
+      PINNED_BUDGET: 'Change would exceed budget_hard pin.',
+    },
+    pins: ['keep_pubsub_ordering', 'no_second_region', 'keep_old_model', 'budget_hard'],
+  };
+
+  if (architecture.id === 'event_driven_checkout') {
+    return {
+      ...common,
+      architectureId: architecture.id,
+      distinctiveFailure: 'Pub/Sub ordering-key throughput ceiling jams the queue at high ordered-event load.',
+      ordinaryHumanControls: ['peakRps', 'budgetGbp'],
+      remediationPaths: [
+        'set_ordering_key_parallelism to spread ordering keys',
+        'set_batching with higher maxBatch within model limits',
+        'set_autoscaling on Cloud Run services',
+        'add_read_replica for zonal failure path',
+      ],
+      stressTool: 'run_stress_test',
+    };
+  }
+
+  if (architecture.id === 'multi_region_saas') {
+    return {
+      ...common,
+      architectureId: architecture.id,
+      distinctiveFailure: 'Regional failure with traffic still routed to the dead region causes visible loss.',
+      ordinaryHumanControls: ['primaryTrafficPercent', 'peakRps', 'budgetGbp'],
+      remediationPaths: [
+        'set_region_traffic_split to shift traffic to surviving region',
+        'set_autoscaling on surviving regional Cloud Run service',
+        'fail_region / restore_region for controlled regional tests',
+      ],
+      stressTool: 'run_stress_test',
+    };
+  }
+
+  return {
+    ...common,
+    architectureId: architecture.id,
+    distinctiveFailure: 'Vertex AI GPU saturation on new model path raises TTFT and overflow.',
+    ordinaryHumanControls: ['newModelPercent', 'peakRps', 'budgetGbp'],
+    remediationPaths: [
+      'set_model_traffic_split to a safe share',
+      'set_autoscaling on Vertex AI endpoints',
+      'set_batching to trade wait time for throughput',
+    ],
+    stressTool: 'run_stress_test',
+  };
+}
+
+const READ_ONLY_TOOLS = new Set([
+  'get_bench_guide',
+  'get_architecture',
+  'get_scenario',
+  'get_live_metrics',
+  'get_root_cause_analysis',
+  'get_constraints',
+]);
+
+function annotateTools(tools: ToolRegistration[]): ToolRegistration[] {
+  return tools.map((tool) => ({
+    ...tool,
+    annotations: { readOnlyHint: READ_ONLY_TOOLS.has(tool.name) },
+  }));
+}
+
 function rootCauseFor(architecture: ArchitectureDefinition, state: State): RootCauseAnalysis {
   const nodeNames = new Map(architecture.nodes.map((node) => [node.id, node.name]));
   const edgeNames = new Map(architecture.edges.map((edge) => [edge.id, `${nodeNames.get(edge.from) ?? edge.from} → ${nodeNames.get(edge.to) ?? edge.to}`]));
@@ -641,6 +726,12 @@ function makeTools(
   read: (op: string, args: Record<string, unknown>, payload: Record<string, unknown>) => DomainResult,
 ): ToolRegistration[] {
   const tools: ToolRegistration[] = [
+    {
+      name: 'get_bench_guide',
+      description: 'Read the signature human-agent loop, valid remediation paths, pin semantics, and error codes for this bench.',
+      inputSchema: toolInputSchema({}),
+      execute: () => read('get_bench_guide', {}, { guide: benchGuideFor(architecture), storeVersion: getState().version }),
+    },
     {
       name: 'get_architecture',
       description: 'Read the current semantic topology, health, failures, exclusions, and store version.',
@@ -767,7 +858,7 @@ function makeTools(
     {
       name: 'restore_component',
       description: 'Restore a runtime component that was killed or failed.',
-      inputSchema: toolInputSchema({ id: { type: 'string' }, expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
+      inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
       execute: (input) => invoke('restore_component', { id: String(input.id) }, Number(input.expectedVersion)),
     },
     {
@@ -807,25 +898,25 @@ function makeTools(
       {
         name: 'set_autoscaling',
         description: 'Change a declared service replica count within the loaded reference.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
         execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
       },
       {
         name: 'set_ordering_key_parallelism',
         description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, orderingKeyShards: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'orderingKeyShards', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), orderingKeyShards: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'orderingKeyShards', 'expectedVersion']),
         execute: (input) => invoke('set_ordering_key_parallelism', { id: String(input.id), orderingKeyShards: Number(input.orderingKeyShards) }, Number(input.expectedVersion)),
       },
       {
         name: 'set_batching',
         description: 'Configure Pub/Sub batching within the declared GCP model limits.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'maxBatch', 'waitMs', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'maxBatch', 'waitMs', 'expectedVersion']),
         execute: (input) => invoke('set_batching', { id: String(input.id), maxBatch: Number(input.maxBatch), waitMs: Number(input.waitMs) }, Number(input.expectedVersion)),
       },
       {
         name: 'add_read_replica',
         description: 'Add a same-region Cloud SQL read replica for the zonal failure path.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
         execute: (input) => invoke('add_read_replica', { id: String(input.id) }, Number(input.expectedVersion)),
       },
     );
@@ -854,7 +945,7 @@ function makeTools(
       {
         name: 'set_autoscaling',
         description: 'Scale a surviving regional Cloud Run service within the reference.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
         execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
       },
     );
@@ -871,18 +962,18 @@ function makeTools(
       {
         name: 'set_autoscaling',
         description: 'Scale one of the Vertex AI serving endpoints within the reference.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
         execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
       },
       {
         name: 'set_batching',
         description: 'Configure deterministic Vertex AI batching and wait time.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'maxBatch', 'waitMs', 'expectedVersion']),
+        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'maxBatch', 'waitMs', 'expectedVersion']),
         execute: (input) => invoke('set_batching', { id: String(input.id), maxBatch: Number(input.maxBatch), waitMs: Number(input.waitMs) }, Number(input.expectedVersion)),
       },
     );
   }
-  return tools;
+  return annotateTools(tools);
 }
 
 function stateFor(state: State) {
