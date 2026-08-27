@@ -21,7 +21,9 @@ import {
   type NodeDefinition,
   type PinId,
   type Region,
+  type ZoneId,
 } from './data';
+import { availableReplicaCount, replicaHealth } from './availability';
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
 
@@ -36,6 +38,9 @@ interface NodeMetric {
   overflowRps?: number;
   ttftMs?: number;
   effectiveHealth: Health;
+  provisionedReplicas: number;
+  availableReplicas: number;
+  replicaZones: ZoneId[];
   capacityModel?: {
     concurrency: number;
     serviceTimeMs: number;
@@ -88,7 +93,7 @@ interface State {
   regionPrimaryPercent: number;
   modelNewPercent: number;
   failedRegions: Region[];
-  failedZones: Array<'a' | 'b'>;
+  failedZones: ZoneId[];
   killedNodes: string[];
   readReplicaAdded: boolean;
   replicaOverrides: Record<string, number>;
@@ -201,11 +206,34 @@ function replicasFor(state: State, node: NodeDefinition) {
   return state.replicaOverrides[node.id] ?? node.replicas;
 }
 
+function zonesForRegion(region: Region): ZoneId[] {
+  return region === 'europe-west2' ? ['europe-west2-a', 'europe-west2-b'] : ['us-east4-a', 'us-east4-b'];
+}
+
+function zonesForArchitecture(architecture: ArchitectureDefinition) {
+  return Array.from(new Set(architecture.nodes.flatMap((node) => node.replicaZones ?? [])));
+}
+
+function replicaPlacementsFor(state: State, node: NodeDefinition) {
+  const replicas = replicasFor(state, node);
+  if (!node.replicaZones?.length) return [];
+  if (replicas <= node.replicaZones.length) return node.replicaZones.slice(0, replicas);
+  const spread = zonesForRegion(node.region);
+  return Array.from({ length: replicas }, (_, index) => node.replicaZones?.[index] ?? spread[index % spread.length]);
+}
+
+function activeReplicasFor(state: State, node: NodeDefinition) {
+  const replicas = replicasFor(state, node);
+  const placements = replicaPlacementsFor(state, node);
+  return placements.length ? availableReplicaCount(placements, state.failedZones) : replicas;
+}
+
 function nodeHealth(state: State, node: NodeDefinition): Health {
   if (state.killedNodes.includes(node.id)) return 'down';
   if (state.failedRegions.includes(node.region)) return 'down';
-  if (node.zone && state.failedZones.includes(node.zone)) return 'down';
-  return 'healthy';
+  const provisioned = replicasFor(state, node);
+  const available = activeReplicasFor(state, node);
+  return replicaHealth(provisioned, available);
 }
 
 function inferenceCapacity(node: NodeDefinition, replicas: number, batch: number) {
@@ -249,7 +277,9 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
 
   for (const node of architecture.nodes) {
     const health = nodeHealth(state, node);
-    const replicas = replicasFor(state, node);
+    const provisionedReplicas = replicasFor(state, node);
+    const replicas = activeReplicasFor(state, node);
+    const replicaZones = replicaPlacementsFor(state, node);
     let capacity = replicas * node.capacityPerReplica;
     let demand = state.peakRps;
     let served = state.peakRps;
@@ -321,7 +351,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     const activeServed = state.stressActive ? served : 0;
     const utilisation = activeDemand > 0 ? Math.min(1.5, activeDemand / Math.max(capacity, 1)) : 0;
     const effectiveHealth: Health =
-      health === 'down' ? 'down' : state.stressActive && utilisation > 1 ? 'degraded' : state.stressActive && utilisation > 0.9 ? 'degraded' : 'healthy';
+      health === 'down' ? 'down' : health === 'degraded' || state.stressActive && utilisation > 0.9 ? 'degraded' : 'healthy';
 
     nodeMetrics[node.id] = {
       demandRps: activeDemand,
@@ -332,6 +362,9 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       overflowRps: overflowRps || undefined,
       ttftMs,
       effectiveHealth,
+      provisionedReplicas,
+      availableReplicas: health === 'down' ? 0 : replicas,
+      replicaZones,
       capacityModel: node.capacityModel ? {
         concurrency: node.capacityModel.concurrency,
         serviceTimeMs: node.capacityModel.serviceTimeMs,
@@ -534,6 +567,9 @@ function makeTools(
             name: node.name,
             kind: node.kind,
             region: node.region,
+            replicaZones: replicaPlacementsFor(state, node),
+            provisionedReplicas: replicasFor(state, node),
+            availableReplicas: activeReplicasFor(state, node),
             health: state.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy',
           })),
           edges: architecture.edges,
@@ -631,16 +667,22 @@ function makeTools(
       inputSchema: toolInputSchema({ id: { type: 'string' }, expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
       execute: (input) => invoke('restore_component', { id: String(input.id) }, Number(input.expectedVersion)),
     },
+    {
+      name: 'fail_zone',
+      description: 'Fail one configured availability zone while leaving the topology and surviving replicas visible.',
+      inputSchema: toolInputSchema({ zone: { type: 'string', enum: zonesForArchitecture(architecture) }, expectedVersion: { type: 'number' } }, ['zone', 'expectedVersion']),
+      execute: (input) => invoke('fail_zone', { zone: String(input.zone) }, Number(input.expectedVersion)),
+    },
+    {
+      name: 'restore_zone',
+      description: 'Restore one failed availability zone and its placed replicas.',
+      inputSchema: toolInputSchema({ zone: { type: 'string', enum: zonesForArchitecture(architecture) }, expectedVersion: { type: 'number' } }, ['zone', 'expectedVersion']),
+      execute: (input) => invoke('restore_zone', { zone: String(input.zone) }, Number(input.expectedVersion)),
+    },
   ];
 
   if (architecture.id === 'event_driven_checkout') {
     tools.push(
-      {
-        name: 'fail_zone',
-        description: 'Fail a zonal data-plane slice without deleting its managed-service reference nodes.',
-        inputSchema: toolInputSchema({ zone: { type: 'string', enum: ['a', 'b'] }, expectedVersion: { type: 'number' } }, ['zone', 'expectedVersion']),
-        execute: (input) => invoke('fail_zone', { zone: String(input.zone) }, Number(input.expectedVersion)),
-      },
       {
         name: 'set_autoscaling',
         description: 'Change a declared service replica count within the loaded reference.',
@@ -769,8 +811,13 @@ function runCommandFor(
       return { state: applyMetrics({ ...state, failedRegions: Array.from(new Set([...state.failedRegions, region])), running: true, stressActive: true }, architecture), result: { region } };
     }
     if (op === 'fail_zone') {
-      const zone = args.zone as 'a' | 'b';
+      const zone = args.zone as ZoneId;
+      if (!zonesForArchitecture(architecture).includes(zone)) return { state, result: { ok: false, code: 'UNKNOWN_ZONE', message: `Unknown availability zone ${zone}.` } };
       return { state: applyMetrics({ ...state, failedZones: Array.from(new Set([...state.failedZones, zone])), running: true, stressActive: true }, architecture), result: { zone } };
+    }
+    if (op === 'restore_zone') {
+      const zone = args.zone as ZoneId;
+      return { state: applyMetrics({ ...state, failedZones: state.failedZones.filter((item) => item !== zone) }, architecture), result: { zone } };
     }
     if (op === 'kill_component') {
       const id = String(args.id);
@@ -902,6 +949,10 @@ function CatalogueView() {
 
 function healthLabel(health: Health) {
   return health === 'healthy' ? 'OK' : health === 'degraded' ? 'WARN' : 'DOWN';
+}
+
+function zoneShortLabel(zone: ZoneId) {
+  return zone.endsWith('-a') ? 'AZ A' : 'AZ B';
 }
 
 function edgeState(edge: EdgeDefinition, state: State) {
@@ -1132,6 +1183,7 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
 function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: { architecture: ArchitectureDefinition; state: State; selectedNodeId: string | null; onSelectNode: (id: string) => void }) {
   const selectedNode = architecture.nodes.find((node) => node.id === selectedNodeId);
   const nodeMap = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture.nodes]);
+  const availabilityZones = zonesForArchitecture(architecture);
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1144,6 +1196,11 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
     <div className="topology-workbench">
       <div className={`graph-board ${architecture.id}`}>
       <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
+      <div className="availability-map" aria-label="Availability zone status">{availabilityZones.map((zone) => {
+        const placements = architecture.nodes.flatMap((node) => replicaPlacementsFor(state, node)).filter((item) => item === zone).length;
+        const failed = state.failedZones.includes(zone);
+        return <div className={`availability-zone ${failed ? 'failed' : ''}`} key={zone}><span>{zone}</span><b>{failed ? 'FAILED' : 'HEALTHY'}</b><small>{failed ? 0 : placements}/{placements} replicas available</small></div>;
+      })}</div>
       {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
       <TopologySignalField architecture={architecture} state={state} />
       <svg className="graph-edges" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
@@ -1161,6 +1218,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
           <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.lastMutation?.op.includes(node.id) ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
             <span className="node-top"><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
             <strong>{node.name}</strong>
+            {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
             <span className="node-stats"><span>{metric ? `${formatNumber(metric.utilisation * 100, 0)}%` : '--'} util</span><span>{healthLabel(health)}</span></span>
           </button>
         );
@@ -1176,7 +1234,7 @@ function NodeInspector({ node, metric, state, onClose }: { node: NodeDefinition;
   return (
     <aside className="node-inspector" aria-label={`${node.name} inspector`}>
       <div className="inspector-head"><div><span className="eyebrow">NODE INSPECTOR</span><h3>{node.name}</h3></div><button className="icon-button" onClick={onClose} aria-label="Close inspector"><span className="close-mark" aria-hidden="true" /></button></div>
-      <dl><div><dt>Kind</dt><dd>{node.kind}</dd></div><div><dt>Region / zone</dt><dd>{node.region}{node.zone ? ` / ${node.zone}` : ''}</dd></div><div><dt>Replicas</dt><dd>{state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
+      <dl><div><dt>Kind</dt><dd>{node.kind}</dd></div><div><dt>Region</dt><dd>{node.region}</dd></div><div><dt>Replica spread</dt><dd>{metric?.replicaZones.length ? metric.replicaZones.map(zoneShortLabel).join(' · ') : 'regional / managed'}</dd></div><div><dt>Replicas available</dt><dd>{metric ? `${metric.availableReplicas} / ${metric.provisionedReplicas}` : state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
       {metric?.queueDepth !== undefined && <p className="inspector-note">Queue depth <b>{formatNumber(metric.queueDepth)}</b> · overflow <b>{formatNumber(metric.overflowRps ?? 0)} req/s</b></p>}
       {metric?.ttftMs !== undefined && <p className="inspector-note">TTFT <b>{formatNumber(metric.ttftMs)} ms</b> · model assumption</p>}
       {metric?.capacityModel && <div className="capacity-equation" aria-label="Capacity model"><span>Capacity model</span><code>{state.replicaOverrides[node.id] ?? node.replicas} replicas × {metric.capacityModel.concurrency} concurrent × 1,000/{metric.capacityModel.serviceTimeMs} ms × {formatNumber(metric.capacityModel.schedulingEfficiency * 100)}% scheduler × {formatNumber(metric.capacityModel.batchGain, 2)} batch</code><small>{formatNumber(metric.capacityModel.reserveRps)} req/s operational reserve shown separately from available headroom.</small></div>}
@@ -1209,6 +1267,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
       ? { label: 'Traffic split', value: `${state.regionPrimaryPercent} / ${100 - state.regionPrimaryPercent}`, note: 'primary / secondary' }
       : { label: 'Release endpoint', value: `${formatNumber((state.nodeMetrics.vertex_rc?.utilisation ?? 0) * 100, 0)}% util`, note: `${formatNumber(state.nodeMetrics.vertex_rc?.ttftMs ?? 350)} ms TTFT` };
   const pins: PinId[] = architecture.id === 'event_driven_checkout' ? ['keep_pubsub_ordering', 'budget_hard'] : architecture.id === 'multi_region_saas' ? ['no_second_region', 'budget_hard'] : ['keep_old_model', 'budget_hard'];
+  const availabilityZones = zonesForArchitecture(architecture);
   return (
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
@@ -1218,6 +1277,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
         {architecture.id === 'multi_region_saas' && <RangeControl label="Primary traffic allocation" value={state.regionPrimaryPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_region_traffic_split', { primaryPercent: value })} />}
         {architecture.id === 'llm_inference_serving' && <RangeControl label="New model traffic" value={state.modelNewPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_model_traffic_split', { newModelPercent: value })} />}
       </section>
+      <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><p>Fail one zone to remove only the replicas placed there. Surviving replicas keep serving at reduced capacity.</p><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
       <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><p>Constraints are domain invariants. The graph stays visible when a region or model is excluded.</p><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
       <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
       <section className="rail-section rail-reference"><div className="section-title"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a></div><p>{architecture.referenceSpec}</p></section>
