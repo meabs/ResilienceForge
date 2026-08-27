@@ -9,3 +9,5 @@ Hero shots for judges and Devpost gallery.
 | [gcp-llm-desktop.png](./gcp-llm-desktop.png) | LLM inference serving with model traffic split |
 
 Open the live project in ChatGPT's in-app browser to see SITE TOOLS register (green lamp). Standard browsers show amber because `document.modelContext` is unavailable outside a WebMCP-enabled session.
+
+See [SMOKE-TEST.md](./SMOKE-TEST.md) for the latest production verification run.
