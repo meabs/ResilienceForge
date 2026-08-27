@@ -58,7 +58,54 @@ for (const tool of tools) {
 }
 ```
 
-Each `tool` contains the required `name`, `description`, `inputSchema`, and `execute` fields. Tools include topology and metric reads, stress tests, replica scaling, zone and region failures, universal component/connection fault injection, and evidence-based root-cause analysis. All tools share the same versioned state and Flight Data Recorder as the visible controls.
+Each `tool` contains the required `name`, `description`, `inputSchema`, and `execute` fields. The complete registration surface is documented below in the same shape used by `document.modelContext.registerTool`.
+
+### Common tools (all architectures)
+
+```ts
+document.modelContext.registerTool({ name: 'get_architecture', description: 'Read the current semantic topology, health, failures, exclusions, and store version.', inputSchema: {}, execute: async (input) => read('get_architecture', input) });
+document.modelContext.registerTool({ name: 'get_scenario', description: 'Read current human scenario controls, targets, pins, and store version.', inputSchema: {}, execute: async (input) => read('get_scenario', input) });
+document.modelContext.registerTool({ name: 'get_live_metrics', description: 'Read demand, served throughput, capacity, utilisation, headroom, queue or overflow, TTFT, and factual observations.', inputSchema: {}, execute: async (input) => read('get_live_metrics', input) });
+document.modelContext.registerTool({ name: 'get_root_cause_analysis', description: 'Explain the current failure using live topology, fault, capacity, SLO, and Flight Data Recorder evidence.', inputSchema: {}, execute: async (input) => read('get_root_cause_analysis', input) });
+document.modelContext.registerTool({ name: 'get_constraints', description: 'Read applicable provider-limit and model-assumption records with source dates and provenance.', inputSchema: {}, execute: async (input) => read('get_constraints', input) });
+document.modelContext.registerTool({ name: 'run_stress_test', description: 'Start the deterministic stress or failure path for the loaded reference.', inputSchema: { expectedVersion: { type: 'number' } }, execute: async (input) => mutate('run_stress_test', input) });
+document.modelContext.registerTool({ name: 'restore_component', description: 'Restore a runtime component that was killed or failed.', inputSchema: { id: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('restore_component', input) });
+document.modelContext.registerTool({ name: 'fail_zone', description: 'Fail one configured availability zone while leaving the topology and surviving replicas visible.', inputSchema: { zone: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('fail_zone', input) });
+document.modelContext.registerTool({ name: 'restore_zone', description: 'Restore one failed availability zone and its placed replicas.', inputSchema: { zone: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('restore_zone', input) });
+document.modelContext.registerTool({ name: 'set_fault_profile', description: 'Inject deterministic latency and request dropout at any declared component or connection in this architecture.', inputSchema: { targetId: { type: 'string' }, latencyMs: { type: 'number', minimum: 0, maximum: 30000 }, dropoutPercent: { type: 'number', minimum: 0, maximum: 100 }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_fault_profile', input) });
+document.modelContext.registerTool({ name: 'clear_fault_profile', description: 'Clear injected latency and dropout from one component or connection.', inputSchema: { targetId: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('clear_fault_profile', input) });
+document.modelContext.registerTool({ name: 'clear_all_faults', description: 'Clear every injected latency and dropout profile while preserving load, scaling, traffic split, pins, and zone state.', inputSchema: { expectedVersion: { type: 'number' } }, execute: async (input) => mutate('clear_all_faults', input) });
+```
+
+`zone` is restricted to the loaded architecture’s configured zones. `targetId` is restricted to its declared components and connections. Every mutating tool requires `expectedVersion`; stale writes return `STALE_STATE` without overwriting human changes.
+
+### Event-driven checkout tools
+
+```ts
+document.modelContext.registerTool({ name: 'set_autoscaling', description: 'Change a declared service replica count within the loaded reference.', inputSchema: { id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_autoscaling', input) });
+document.modelContext.registerTool({ name: 'set_ordering_key_parallelism', description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.', inputSchema: { id: { type: 'string' }, orderingKeyShards: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_ordering_key_parallelism', input) });
+document.modelContext.registerTool({ name: 'set_batching', description: 'Configure Pub/Sub batching within the declared GCP model limits.', inputSchema: { id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_batching', input) });
+document.modelContext.registerTool({ name: 'add_read_replica', description: 'Add a same-region Cloud SQL read replica for the zonal failure path.', inputSchema: { id: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('add_read_replica', input) });
+```
+
+### Multi-region SaaS tools
+
+```ts
+document.modelContext.registerTool({ name: 'fail_region', description: 'Fail one configured region while keeping its reference topology visible.', inputSchema: { region: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('fail_region', input) });
+document.modelContext.registerTool({ name: 'restore_region', description: 'Restore one failed region and its placed services.', inputSchema: { region: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('restore_region', input) });
+document.modelContext.registerTool({ name: 'set_region_traffic_split', description: 'Set the primary-region traffic allocation.', inputSchema: { primaryPercent: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_region_traffic_split', input) });
+document.modelContext.registerTool({ name: 'set_autoscaling', description: 'Scale a surviving regional Cloud Run service within the reference.', inputSchema: { id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_autoscaling', input) });
+```
+
+### LLM inference serving tools
+
+```ts
+document.modelContext.registerTool({ name: 'set_model_traffic_split', description: 'Set the release-candidate share of model traffic.', inputSchema: { newModelPercent: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_model_traffic_split', input) });
+document.modelContext.registerTool({ name: 'set_autoscaling', description: 'Scale one of the Vertex AI serving endpoints within the reference.', inputSchema: { id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_autoscaling', input) });
+document.modelContext.registerTool({ name: 'set_batching', description: 'Configure deterministic Vertex AI batching and wait time.', inputSchema: { id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_batching', input) });
+```
+
+The `read` and `mutate` names above are documentation aliases for the page’s state-backed handlers; the live implementation is in [`app/resilience-forge.tsx`](./app/resilience-forge.tsx), and the bridge that invokes `document.modelContext.registerTool` is [`app/webmcp.ts`](./app/webmcp.ts). All tools share the same versioned state and Flight Data Recorder as the visible controls.
 
 The experience was designed for the [WebMCP Challenge](https://openai.com/webmcp-challenge/) with the practical design guidance from [Impeccable](https://github.com/pbakaus/impeccable).
 
