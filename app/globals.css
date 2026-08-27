@@ -142,7 +142,22 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .availability-zone small { grid-column: 1 / -1; color: var(--quiet); font-size: 7px; }
 .availability-zone.failed { background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 10%, transparent) 0 5px, transparent 5px 10px); animation: failure-border 1.15s ease-in-out infinite alternate; }
 .availability-zone.failed b { color: var(--red); }
-.service-planes { position: absolute; z-index: 0; inset: 86px 12px 38px; display: grid; grid-template-columns: 31% 39% 30%; pointer-events: none; }
+.zone-frames { position: absolute; z-index: 0; inset: 86px 12px 38px; pointer-events: none; }
+.zone-frames > div { position: absolute; border: 1px solid #3a4a56; background: color-mix(in srgb, var(--steel) 22%, transparent); }
+.zone-frames > div::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(135deg, transparent 0 17px, color-mix(in srgb, var(--line) 13%, transparent) 17px 18px); opacity: .35; }
+.zone-frames > div > span, .zone-frames > div > small { position: absolute; left: 10px; z-index: 1; color: var(--quiet); font-family: var(--font-mono); font-size: 8px; letter-spacing: .09em; text-transform: uppercase; }
+.zone-frames > div > span { top: 9px; }
+.zone-frames > div > small { right: 10px; left: auto; bottom: 8px; color: color-mix(in srgb, var(--quiet) 72%, transparent); font-size: 7px; }
+.zone-frame-column { top: 0; bottom: 0; }
+.zone-frame-edge { left: 0; width: 31%; }
+.zone-frame-compute { left: 31%; width: 39%; }
+.zone-frame-state { right: 0; width: 30%; }
+.zone-frame-region { left: 0; right: 0; height: 48%; }
+.zone-frame-eu { top: 0; }
+.zone-frame-us { bottom: 0; }
+.zone-frames-multi_region_saas > div { background: color-mix(in srgb, var(--steel) 18%, transparent); }
+.zone-frames-multi_region_saas .zone-frame-region > span { color: var(--cyan); }
+.service-planes { display: none; }
 .service-planes div { position: relative; border-inline-end: 1px dashed color-mix(in srgb, var(--line) 60%, transparent); }
 .service-planes div:last-child { border-inline-end: 0; }
 .service-planes span { position: absolute; inset: auto 8px 8px; color: color-mix(in srgb, var(--quiet) 70%, transparent); font-family: var(--font-mono); font-size: 7px; letter-spacing: .08em; text-align: center; }
@@ -159,7 +174,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 @keyframes edge-hit { 0% { stroke-width: 10; opacity: 1; } 100% { stroke-width: 4; opacity: .9; } }
 @keyframes edge-failure { from { opacity: .42; } to { opacity: 1; } }
 @keyframes failure-border { from { box-shadow: inset 0 0 0 0 transparent; } to { box-shadow: inset 0 0 14px color-mix(in srgb, var(--red) 30%, transparent); } }
-.region-zone { position: absolute; z-index: 0; top: 64px; bottom: 34px; width: 39%; border: 1px dashed #3c4b57; pointer-events: none; }
+.region-zone { display: none; }
 .region-zone span { position: absolute; top: 10px; left: 12px; color: #6b7a85; font-family: var(--font-mono); font-size: 8px; letter-spacing: .1em; }
 .region-zone.region-a { left: 14%; }
 .region-zone.region-b { right: 5%; }

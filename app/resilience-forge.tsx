@@ -1336,6 +1336,16 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
   const availabilityZones = zonesForArchitecture(architecture);
   const planes = architecturePlanes(architecture);
   const hasActiveFailure = state.failedZones.length > 0 || state.failedRegions.length > 0 || state.killedNodes.length > 0 || Object.keys(state.faults).length > 0 || (state.stressActive && !state.sim.sloPass);
+  const zoneFrames = architecture.id === 'multi_region_saas'
+    ? [
+        { key: 'eu', label: 'SHARED VPC / EUROPE-WEST2', className: 'zone-frame-region zone-frame-eu' },
+        { key: 'us', label: 'SHARED VPC / US-EAST4', className: 'zone-frame-region zone-frame-us' },
+      ]
+    : [
+        { key: 'edge', label: architecture.id === 'llm_inference_serving' ? 'EDGE / API' : 'EDGE / INGRESS', className: 'zone-frame-column zone-frame-edge' },
+        { key: 'compute', label: architecture.id === 'llm_inference_serving' ? 'ROUTING / SERVING' : architecture.id === 'event_driven_checkout' ? 'ORDER / EVENT' : 'REGIONAL COMPUTE', className: 'zone-frame-column zone-frame-compute' },
+        { key: 'state', label: architecture.id === 'llm_inference_serving' ? 'CACHE / OVERFLOW' : architecture.id === 'event_driven_checkout' ? 'PAYMENT / STATE' : 'DATA / REPLICATION', className: 'zone-frame-column zone-frame-state' },
+      ];
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1354,6 +1364,9 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
         const failed = state.failedZones.includes(zone);
         return <div className={`availability-zone ${failed ? 'failed' : ''}`} key={zone}><span>{zone}</span><b>{failed ? 'FAILED' : 'HEALTHY'}</b><small>{failed ? 0 : placements}/{placements} replicas available</small></div>;
       })}</div>
+      <div className={`zone-frames zone-frames-${architecture.id}`} aria-label="Architecture zones">
+        {zoneFrames.map((zone) => <div className={zone.className} key={zone.key}><span>{zone.label}</span><small>COMPONENTS IN ZONE</small></div>)}
+      </div>
       <div className="service-planes" aria-hidden="true">{planes.map((plane) => <div key={plane}><span>{plane}</span></div>)}</div>
       {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
       <TopologySignalField architecture={architecture} state={state} />
