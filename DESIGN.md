@@ -136,7 +136,7 @@ Use graphite and steel as the field. Accents are scarce and semantic: orange mea
 
 The Catalogue opens with a generous two-column thesis and a three-column reference grid. The Bench uses a 70/30 working split: a dominant topology canvas on the left and an always-visible scenario rail on the right. A sticky FDR ticker anchors the bottom of the Bench as the durable evidence layer.
 
-The layout is dense but breathable: 16–22px gaps inside working areas, 32px outer Bench padding, and up to 48px Catalogue gutters. At narrower widths the two-column thesis stacks, the reference grid becomes one column, and the Bench canvas precedes the scenario rail. The topology keeps its own responsive coordinate system so nodes remain inside the field on small screens.
+The layout is dense but breathable: 16–22px gaps inside working areas, 32px outer Bench padding, and up to 48px Catalogue gutters. The Bench graph is clamped to the available first viewport instead of growing into an empty wall of canvas; on desktop the scenario rail remains sticky and independently scrollable so controls stay reachable beside the topology. At narrower widths the two-column thesis stacks, the reference grid becomes one column, and the Bench canvas precedes the scenario rail. The topology keeps its own responsive coordinate system, compact header, and smaller node cards so the graph remains legible inside the field on small screens.
 
 ## Elevation & Depth
 
