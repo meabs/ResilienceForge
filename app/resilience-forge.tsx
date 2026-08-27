@@ -127,13 +127,12 @@ function compactArgs(args: Record<string, unknown>) {
   return text === '{}' ? '{}' : text.length > 78 ? `${text.slice(0, 75)}...}` : text;
 }
 
-function clockTime() {
-  return new Date().toLocaleTimeString('en-GB', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
+function simulationTime(tick: number) {
+  const totalSeconds = Math.max(0, Math.round(tick * 0.5));
+  const hours = Math.floor(totalSeconds / 3600).toString().padStart(2, '0');
+  const minutes = Math.floor((totalSeconds % 3600) / 60).toString().padStart(2, '0');
+  const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+  return `${hours}:${minutes}:${seconds}`;
 }
 
 function defaultReplicas(architecture: ArchitectureDefinition) {
@@ -387,7 +386,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
 }
 
 function appendLog(state: State, entry: Omit<FdrEntry, 'ts'>) {
-  return [...state.log, { ...entry, ts: clockTime() }].slice(-30);
+  return [...state.log, { ...entry, ts: simulationTime(state.tick) }].slice(-30);
 }
 
 function mutate(
