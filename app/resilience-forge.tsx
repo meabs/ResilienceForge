@@ -30,6 +30,7 @@ import { evaluateSlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
 import { gcpIconFor } from './gcp-icons';
+import { connectionGeometry, connectionPath, type GraphPoint } from './topology-layout';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -1232,51 +1233,6 @@ function edgeState(edge: EdgeDefinition, state: State) {
   return state.edgeMetrics[edge.id]?.health ?? 'healthy';
 }
 
-interface GraphPoint {
-  x: number;
-  y: number;
-}
-
-interface ConnectionGeometry {
-  start: GraphPoint;
-  control: GraphPoint;
-  end: GraphPoint;
-}
-
-function graphPoint(node: NodeDefinition): GraphPoint {
-  return { x: node.x * 10, y: node.y * 6 };
-}
-
-function lerpPoint(from: GraphPoint, to: GraphPoint, amount: number): GraphPoint {
-  return { x: from.x + (to.x - from.x) * amount, y: from.y + (to.y - from.y) * amount };
-}
-
-function connectionGeometry(edge: EdgeDefinition, nodes: Map<string, NodeDefinition>): ConnectionGeometry | null {
-  const fromNode = nodes.get(edge.from);
-  const toNode = nodes.get(edge.to);
-  if (!fromNode || !toNode) return null;
-
-  const from = graphPoint(fromNode);
-  const to = graphPoint(toNode);
-  const start = lerpPoint(from, to, 0.09);
-  const end = lerpPoint(from, to, 0.91);
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  const horizontal = Math.abs(dx) >= Math.abs(dy);
-  const bend = Math.min(34, Math.max(14, Math.max(Math.abs(dx), Math.abs(dy)) * 0.18));
-  const control = horizontal
-    ? { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 + (Math.abs(dy) > 8 ? Math.sign(dy) * bend : 0) }
-    : { x: (start.x + end.x) / 2 + (Math.abs(dx) > 8 ? Math.sign(dx) * bend : 0), y: (start.y + end.y) / 2 };
-
-  return { start, control, end };
-}
-
-function connectionPath(edge: EdgeDefinition, nodes: Map<string, NodeDefinition>) {
-  const geometry = connectionGeometry(edge, nodes);
-  if (!geometry) return '';
-  return `M ${geometry.start.x} ${geometry.start.y} Q ${geometry.control.x} ${geometry.control.y} ${geometry.end.x} ${geometry.end.y}`;
-}
-
 function signalColor(health: Health) {
   return health === 'down' ? 0xe35b63 : health === 'degraded' ? 0xff8b24 : 0x63d5e5;
 }
@@ -1335,11 +1291,16 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
       const geometry = connectionGeometry(edge, nodeMap);
       if (!geometry) return [];
       const toWorld = (point: GraphPoint) => new THREE.Vector3(point.x / 50 - 1, 1 - point.y / 50, 0);
-      const curve = new THREE.QuadraticBezierCurve3(toWorld(geometry.start), toWorld(geometry.control), toWorld(geometry.end));
+      const worldPoints = geometry.points.map(toWorld);
+      const curve = new THREE.CurvePath<THREE.Vector3>();
+      worldPoints.slice(1).forEach((point, index) => {
+        curve.add(new THREE.LineCurve3(worldPoints[index], point));
+      });
       const lineMaterial = new THREE.LineBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.38 });
       const glowMaterial = new THREE.LineBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.08, blending: THREE.AdditiveBlending });
-      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(40)), lineMaterial);
-      const glow = new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(40)), glowMaterial);
+      const sampled = curve.getSpacedPoints(40);
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(sampled), lineMaterial);
+      const glow = new THREE.Line(new THREE.BufferGeometry().setFromPoints(sampled), glowMaterial);
       const packets = [0, 1].map(() => {
         const material = new THREE.MeshBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending });
         const packet = new THREE.Mesh(packetGeometry, material);
@@ -1462,7 +1423,6 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
     [architecture, state.failedRegions, state.failedZones, state.pins],
   );
   const hasActiveFailure = state.failedZones.length > 0 || state.failedRegions.length > 0 || state.killedNodes.length > 0 || Object.keys(state.faults).length > 0 || (state.stressActive && !state.sim.sloPass);
-  const isMultiRegion = architecture.id === 'multi_region_saas';
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1473,33 +1433,44 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
   }, [onSelectNode, selectedNode]);
   return (
     <div className="topology-workbench">
-      <div className={`graph-board ${architecture.id} ${hasActiveFailure ? 'failure-active' : ''}`}>
+      <div className={`graph-board ${architecture.id} ${hasActiveFailure ? 'failure-active' : ''}`} tabIndex={0} aria-label="Architecture topology. Scroll horizontally if the diagram extends beyond the view.">
+      <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span><span className="graph-scroll-hint">scroll topology</span></div>
+      <div className="graph-stage">
       {hasActiveFailure && <div className="failure-propagation" aria-hidden="true"><span>FAILURE PROPAGATION</span></div>}
-      <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
-      <div className={`gcp-topology-frame ${isMultiRegion ? 'gcp-topology-multi' : 'gcp-topology-regional'}`} aria-label="GCP deployment topology">
-        <div className="gcp-global-strip">
-          <span className="gcp-frame-label">{topologyFrame.globalLabel}</span>
-          <small>{topologyFrame.globalSublabel}</small>
-        </div>
+      <div className={`gcp-topology-frame gcp-topology-${topologyFrame.layout}`} aria-label="GCP deployment topology">
+        {topologyFrame.layout === 'pair' && (
+          <div className="gcp-global-strip">
+            <span className="gcp-frame-label">{topologyFrame.globalLabel}</span>
+            <small>{topologyFrame.globalSublabel}</small>
+          </div>
+        )}
         <div className="gcp-region-stack">
           {topologyFrame.regions.map((region) => (
             <div className={`${region.className} ${region.failed ? 'failed' : ''}`} key={region.key}>
               <div className="gcp-region-header">
-                <span>{region.label}</span>
-                <small>{region.sublabel}</small>
-              </div>
-              <div className="gcp-zone-row">
-                {region.zones.map((zone) => (
-                  <div className={`${zone.className} ${zone.failed ? 'failed' : ''}`} key={zone.key}>
-                    <span>{zone.label}</span>
-                    <small>{zone.sublabel}</small>
-                  </div>
-                ))}
+                <div>
+                  <span>{region.label}</span>
+                  <small>{region.sublabel}</small>
+                </div>
+                <div className="gcp-zone-chips">
+                  {region.zones.map((zone) => (
+                    <i className={`${zone.className} ${zone.failed ? 'failed' : ''}`} key={zone.key} title={zone.sublabel}>{zone.label}</i>
+                  ))}
+                </div>
               </div>
             </div>
           ))}
         </div>
       </div>
+      {topologyFrame.layout === 'regional' && (
+        <div className="topology-lanes" aria-hidden="true">
+          {topologyFrame.lanes.map((lane) => (
+            <div className="topology-lane" key={lane.key} style={{ left: `${lane.start}%`, width: `${lane.end - lane.start}%` }}>
+              <span>{lane.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <TopologySignalField architecture={architecture} state={state} />
       <svg className="graph-edges" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
         <defs><marker id={`edge-arrow-${architecture.id}`} markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" /></marker></defs>
@@ -1523,6 +1494,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
         );
       })}
       <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />failure propagation</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
+      </div>
       </div>
       {selectedNode && <NodeInspector architecture={architecture} node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} invoke={invoke} onClose={() => onSelectNode('')} />}
     </div>
