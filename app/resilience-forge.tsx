@@ -9,8 +9,8 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
 } from 'react';
+import * as THREE from 'three';
 import {
   architectures,
   getArchitecture,
@@ -881,23 +881,242 @@ function edgeState(edge: EdgeDefinition, state: State) {
   return state.edgeMetrics[edge.id]?.health ?? 'healthy';
 }
 
+interface GraphPoint {
+  x: number;
+  y: number;
+}
+
+interface ConnectionGeometry {
+  start: GraphPoint;
+  control: GraphPoint;
+  end: GraphPoint;
+}
+
+function graphPoint(node: NodeDefinition): GraphPoint {
+  return { x: node.x * 10, y: node.y * 6 };
+}
+
+function lerpPoint(from: GraphPoint, to: GraphPoint, amount: number): GraphPoint {
+  return { x: from.x + (to.x - from.x) * amount, y: from.y + (to.y - from.y) * amount };
+}
+
+function connectionGeometry(edge: EdgeDefinition, nodes: Map<string, NodeDefinition>): ConnectionGeometry | null {
+  const fromNode = nodes.get(edge.from);
+  const toNode = nodes.get(edge.to);
+  if (!fromNode || !toNode) return null;
+
+  const from = graphPoint(fromNode);
+  const to = graphPoint(toNode);
+  const start = lerpPoint(from, to, 0.09);
+  const end = lerpPoint(from, to, 0.91);
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  const bend = Math.min(34, Math.max(14, Math.max(Math.abs(dx), Math.abs(dy)) * 0.18));
+  const control = horizontal
+    ? { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 + (Math.abs(dy) > 8 ? Math.sign(dy) * bend : 0) }
+    : { x: (start.x + end.x) / 2 + (Math.abs(dx) > 8 ? Math.sign(dx) * bend : 0), y: (start.y + end.y) / 2 };
+
+  return { start, control, end };
+}
+
+function connectionPath(edge: EdgeDefinition, nodes: Map<string, NodeDefinition>) {
+  const geometry = connectionGeometry(edge, nodes);
+  if (!geometry) return '';
+  return `M ${geometry.start.x} ${geometry.start.y} Q ${geometry.control.x} ${geometry.control.y} ${geometry.end.x} ${geometry.end.y}`;
+}
+
+function signalColor(health: Health) {
+  return health === 'down' ? 0xe35b63 : health === 'degraded' ? 0xff8b24 : 0x63d5e5;
+}
+
+function signalOpacity(health: Health) {
+  return health === 'down' ? 0.12 : health === 'degraded' ? 0.72 : 0.38;
+}
+
+function createSignalTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, 'rgba(255,255,255,1)');
+  gradient.addColorStop(0.16, 'rgba(255,255,255,.82)');
+  gradient.addColorStop(0.42, 'rgba(255,255,255,.18)');
+  gradient.addColorStop(1, 'rgba(255,255,255,0)');
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(canvas);
+}
+
+function TopologySignalField({ architecture, state }: { architecture: ArchitectureDefinition; state: State }) {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const stateRef = useRef(state);
+  const sceneApiRef = useRef<{ update: (nextState: State) => void; render: () => void } | null>(null);
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: 'low-power' });
+    } catch {
+      mount.dataset.fallback = 'true';
+      return;
+    }
+
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x000000, 0);
+    renderer.domElement.setAttribute('aria-hidden', 'true');
+    mount.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+    camera.position.z = 3;
+    const nodeMap = new Map(architecture.nodes.map((node) => [node.id, node]));
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const packetGeometry = new THREE.SphereGeometry(0.018, 8, 8);
+    const anchorGeometry = new THREE.RingGeometry(0.014, 0.02, 16);
+    const signalTexture = createSignalTexture();
+    const entries = architecture.edges.flatMap((edge, index) => {
+      const geometry = connectionGeometry(edge, nodeMap);
+      if (!geometry) return [];
+      const toWorld = (point: GraphPoint) => new THREE.Vector3(point.x / 50 - 1, 1 - point.y / 50, 0);
+      const curve = new THREE.QuadraticBezierCurve3(toWorld(geometry.start), toWorld(geometry.control), toWorld(geometry.end));
+      const lineMaterial = new THREE.LineBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.38 });
+      const glowMaterial = new THREE.LineBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.08, blending: THREE.AdditiveBlending });
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(40)), lineMaterial);
+      const glow = new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(40)), glowMaterial);
+      const packets = [0, 1].map(() => {
+        const material = new THREE.MeshBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending });
+        const packet = new THREE.Mesh(packetGeometry, material);
+        const glowMaterial = new THREE.SpriteMaterial({ map: signalTexture, color: signalColor('healthy'), transparent: true, opacity: 0.34, depthWrite: false, blending: THREE.AdditiveBlending });
+        const glow = new THREE.Sprite(glowMaterial);
+        glow.scale.setScalar(0.12);
+        packet.position.copy(curve.getPoint(0.1));
+        glow.position.copy(packet.position);
+        packet.position.z = 0.02;
+        glow.position.z = 0.015;
+        return { mesh: packet, material, glow, glowMaterial };
+      });
+      line.position.z = -0.01;
+      glow.position.z = -0.02;
+      scene.add(glow, line, ...packets.flatMap((packet) => [packet.glow, packet.mesh]));
+      return { edge, index, curve, line, glow, lineMaterial, glowMaterial, packets };
+    });
+
+    const anchors = architecture.nodes.map((node) => {
+      const material = new THREE.MeshBasicMaterial({ color: signalColor('healthy'), transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, side: THREE.DoubleSide });
+      const anchor = new THREE.Mesh(anchorGeometry, material);
+      anchor.position.set(node.x / 50 - 1, 1 - node.y / 50, -0.015);
+      scene.add(anchor);
+      return { node, anchor, material };
+    });
+
+    const resize = () => {
+      const width = Math.max(1, mount.clientWidth);
+      const height = Math.max(1, mount.clientHeight);
+      renderer.setSize(width, height, false);
+      renderer.render(scene, camera);
+    };
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(mount);
+
+    const update = (nextState: State) => {
+      const elapsed = performance.now() / 1000;
+      entries.forEach((entry) => {
+        const health = edgeState(entry.edge, nextState);
+        const color = signalColor(health);
+        entry.lineMaterial.color.setHex(color);
+        entry.glowMaterial.color.setHex(color);
+        entry.lineMaterial.opacity = signalOpacity(health);
+        entry.glowMaterial.opacity = health === 'down' ? 0.025 : health === 'degraded' ? 0.16 : 0.08;
+        entry.packets.forEach((packet, packetIndex) => {
+          packet.material.color.setHex(color);
+          packet.glowMaterial.color.setHex(color);
+          packet.mesh.visible = health !== 'down' && !reducedMotion;
+          packet.glow.visible = packet.mesh.visible;
+          if (packet.mesh.visible) {
+            const speed = health === 'degraded' ? 0.2 : 0.14;
+            const progress = (elapsed * speed + packetIndex * 0.29 + entry.index * 0.07) % 1;
+            packet.mesh.position.copy(entry.curve.getPoint(progress));
+            packet.glow.position.copy(packet.mesh.position);
+            packet.glow.scale.setScalar(0.1 + Math.sin(elapsed * 4 + packetIndex) * 0.025);
+            packet.mesh.position.z = 0.02;
+            packet.glow.position.z = 0.015;
+          }
+        });
+      });
+
+      anchors.forEach(({ node, anchor, material }, index) => {
+        const health = nextState.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy';
+        material.color.setHex(signalColor(health));
+        material.opacity = health === 'down' ? 0.08 : health === 'degraded' ? 0.52 : 0.3;
+        const pulse = reducedMotion ? 1 : 1 + Math.sin(elapsed * 1.6 + index * 0.7) * 0.16;
+        anchor.scale.setScalar(pulse);
+      });
+    };
+
+    const render = () => renderer.render(scene, camera);
+    sceneApiRef.current = { update, render };
+    update(stateRef.current);
+    resize();
+
+    let animationFrame = 0;
+    const animate = () => {
+      update(stateRef.current);
+      render();
+      animationFrame = requestAnimationFrame(animate);
+    };
+    if (!reducedMotion) animationFrame = requestAnimationFrame(animate);
+
+    return () => {
+      cancelAnimationFrame(animationFrame);
+      resizeObserver.disconnect();
+      sceneApiRef.current = null;
+      entries.forEach((entry) => {
+        entry.lineMaterial.dispose();
+        entry.glowMaterial.dispose();
+        entry.line.geometry.dispose();
+        entry.glow.geometry.dispose();
+        entry.packets.forEach((packet) => packet.material.dispose());
+        entry.packets.forEach((packet) => packet.glowMaterial.dispose());
+      });
+      anchors.forEach(({ material }) => material.dispose());
+      packetGeometry.dispose();
+      anchorGeometry.dispose();
+      signalTexture?.dispose();
+      renderer.dispose();
+      renderer.domElement.remove();
+    };
+  }, [architecture]);
+
+  useEffect(() => {
+    stateRef.current = state;
+    sceneApiRef.current?.update(state);
+    sceneApiRef.current?.render();
+  }, [state]);
+
+  return <div ref={mountRef} className="topology-signal-field" aria-hidden="true" />;
+}
+
 function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: { architecture: ArchitectureDefinition; state: State; selectedNodeId: string | null; onSelectNode: (id: string) => void }) {
   const selectedNode = architecture.nodes.find((node) => node.id === selectedNodeId);
+  const nodeMap = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture.nodes]);
   return (
     <div className={`graph-board ${architecture.id}`}>
       <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
       {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
+      <TopologySignalField architecture={architecture} state={state} />
       <svg className="graph-edges" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
-        <defs><marker id="edge-arrow" markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" /></marker></defs>
+        <defs><marker id={`edge-arrow-${architecture.id}`} markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" /></marker></defs>
         {architecture.edges.map((edge) => {
           const stateClass = edgeState(edge, state);
-          return <polyline key={edge.id} points={edge.points} className={`graph-edge edge-${stateClass} edge-${edge.kind}`} markerEnd="url(#edge-arrow)" />;
+          return <path key={edge.id} d={connectionPath(edge, nodeMap)} className={`graph-edge edge-${stateClass} edge-${edge.kind}`} markerEnd={`url(#edge-arrow-${architecture.id})`} />;
         })}
       </svg>
-      {architecture.edges.map((edge) => {
-        const status = edgeState(edge, state);
-        return <span key={`${edge.id}-packet`} className={`edge-packets packets-${status} packets-${edge.kind}`} style={{ offsetPath: `path('M ${edge.points.replaceAll(' ', ' L ')}')` } as CSSProperties} aria-hidden="true"><i /><i /><i /></span>;
-      })}
       {architecture.nodes.map((node) => {
         const metric = state.nodeMetrics[node.id];
         const health = metric?.effectiveHealth ?? 'healthy';
@@ -911,7 +1130,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
         );
       })}
       {selectedNode && <NodeInspector node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} onClose={() => onSelectNode('')} />}
-      <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />saturated flow</span><span><i className="legend-swatch down" />down / excluded</span></div>
+      <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />saturated flow</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
     </div>
   );
 }
