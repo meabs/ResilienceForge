@@ -137,6 +137,10 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .availability-zone small { grid-column: 1 / -1; color: var(--quiet); font-size: 7px; }
 .availability-zone.failed { background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 10%, transparent) 0 5px, transparent 5px 10px); }
 .availability-zone.failed b { color: var(--red); }
+.service-planes { position: absolute; z-index: 0; inset: 86px 12px 38px; display: grid; grid-template-columns: 31% 39% 30%; pointer-events: none; }
+.service-planes div { position: relative; border-inline-end: 1px dashed color-mix(in srgb, var(--line) 60%, transparent); }
+.service-planes div:last-child { border-inline-end: 0; }
+.service-planes span { position: absolute; inset: auto 8px 8px; color: color-mix(in srgb, var(--quiet) 70%, transparent); font-family: var(--font-mono); font-size: 7px; letter-spacing: .08em; text-align: center; }
 .topology-signal-field { position: absolute; z-index: 2; inset: 0; pointer-events: none; opacity: .92; }
 .topology-signal-field canvas { width: 100%; height: 100%; display: block; }
 .graph-edges { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; overflow: visible; }
@@ -159,6 +163,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .graph-node.accent-cyan { --node-accent: var(--cyan); }
 .graph-node.accent-violet { --node-accent: var(--violet); }
 .graph-node.node-degraded { border-color: var(--orange); }
+.graph-node.fault-active { border-style: dashed; border-color: var(--red); }
 .graph-node.node-down { border-color: var(--red); background: repeating-linear-gradient(135deg, #24272c 0 7px, #2b2228 7px 14px); }
 .graph-node.mutation-webmcp { animation: node-hit 1.2s ease-out; }
 .graph-node.mutation-ui { animation: node-human-hit .7s ease-out; }
@@ -174,6 +179,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .replica-spread i span { color: var(--muted); font-family: var(--font-mono); font-size: 5px; letter-spacing: 0; white-space: nowrap; }
 .replica-spread i.failed { border-color: var(--red); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 25%, var(--steel)) 0 2px, var(--steel) 2px 4px); }
 .replica-spread i.failed span { color: var(--red); text-decoration: line-through; }
+.fault-mark { margin-top: 6px; padding-top: 4px; border-top: 1px dashed color-mix(in srgb, var(--red) 55%, transparent); display: block; overflow: hidden; color: var(--red); font-family: var(--font-mono); font-size: 6px; letter-spacing: .01em; text-overflow: ellipsis; white-space: nowrap; }
 .node-stats { margin-top: 10px; display: flex; justify-content: space-between; gap: 6px; color: var(--muted); font-family: var(--font-mono); font-size: 8px; letter-spacing: .02em; text-transform: uppercase; }
 .node-degraded .node-stats span:last-child { color: var(--orange); }
 .node-down .node-stats span:last-child { color: var(--red); }
@@ -207,6 +213,16 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .capacity-equation span, .capacity-equation small { color: var(--quiet); font-family: var(--font-mono); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
 .capacity-equation code { color: var(--paper); font-family: var(--font-mono); font-size: 9px; line-height: 1.55; }
 .capacity-equation small { color: var(--muted); letter-spacing: .02em; line-height: 1.45; text-transform: none; }
+.fault-readout { margin-top: 12px; padding: 10px; border: 1px dashed var(--line); display: grid; gap: 5px; }
+.fault-readout span, .fault-readout small { color: var(--quiet); font-family: var(--font-mono); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; }
+.fault-readout code { color: var(--muted); font-family: var(--font-mono); font-size: 9px; }
+.fault-readout small { letter-spacing: .02em; text-transform: none; }
+.fault-readout.active { border-color: var(--red); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 8%, transparent) 0 5px, transparent 5px 10px); }
+.fault-readout.active span, .fault-readout.active code { color: var(--red); }
+.fault-presets { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.fault-presets button { min-height: 34px; padding: 5px 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); font-family: var(--font-mono); font-size: 7px; letter-spacing: .03em; text-transform: uppercase; cursor: pointer; }
+.fault-presets button:hover:not(:disabled) { border-color: var(--red); color: var(--paper); }
+.fault-presets button:disabled { opacity: .38; cursor: not-allowed; }
 
 .metric-strip { margin-top: 17px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .metric-cell { min-width: 0; padding: 13px 12px 14px; border-right: 1px solid var(--line-soft); }
@@ -254,6 +270,16 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .zone-controls button strong { color: var(--muted); font-size: 7px; font-weight: 500; letter-spacing: .04em; white-space: nowrap; }
 .zone-controls button.failed { border-color: var(--red); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 10%, #172027) 0 6px, #172027 6px 12px); }
 .zone-controls button.failed b, .zone-controls button.failed strong { color: var(--red); }
+.fault-empty { padding: 10px; border: 1px dashed var(--line); display: grid; gap: 4px; }
+.fault-empty span, .fault-empty small { color: var(--quiet); font-family: var(--font-mono); font-size: 8px; letter-spacing: .06em; }
+.fault-empty small { color: var(--muted); letter-spacing: .01em; }
+.fault-list { display: grid; gap: 7px; }
+.fault-list > div { padding: 7px 9px; border: 1px dashed color-mix(in srgb, var(--red) 58%, var(--line)); display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.fault-list code, .fault-list span { overflow: hidden; font-family: var(--font-mono); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.fault-list code { color: var(--red); }
+.fault-list span { color: var(--muted); }
+.fault-list button { min-height: 36px; padding: 0 10px; border: 1px solid var(--red); background: transparent; color: var(--paper); font-family: var(--font-mono); font-size: 8px; letter-spacing: .05em; text-transform: uppercase; cursor: pointer; }
+.fault-list button:hover { background: var(--red); color: var(--graphite); }
 .pin-list { display: grid; gap: 9px; }
 .pin-stamp { min-height: 37px; padding: 8px 10px; border: 1px dashed #52616d; background: #172027; display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: center; gap: 8px; color: var(--muted); font-family: var(--font-mono); font-size: 9px; letter-spacing: .04em; text-align: left; cursor: pointer; }
 .pin-stamp:hover { border-color: var(--paper); color: var(--paper); }
@@ -360,16 +386,20 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
   .availability-zone span { font-size: 6px; }
   .availability-zone b { font-size: 6px; }
   .availability-zone small { display: none; }
+  .service-planes { top: 96px; inset-inline: 6px; bottom: 34px; }
+  .service-planes span { display: none; }
   .graph-node { width: 64px; min-height: 76px; padding: 7px 6px; }
   .graph-node strong { margin-top: 6px; font-size: 9px; }
   .node-stats { margin-top: 6px; font-size: 6px; }
   .replica-spread { margin-top: 5px; gap: 2px; }
   .replica-spread i { min-width: 8px; width: 8px; height: 6px; padding: 0; }
   .replica-spread i span { display: none; }
+  .fault-mark { font-size: 5px; }
   .region-zone { width: 42%; top: 58px; bottom: 35px; }
   .region-zone span { left: 6px; font-size: 7px; letter-spacing: .04em; writing-mode: vertical-rl; }
   .node-inspector { grid-template-columns: 1fr; }
   .node-inspector dl { margin-top: 13px; grid-row: auto; }
+  .fault-presets { grid-template-columns: 1fr; }
   .graph-legend { left: 10px; right: 10px; bottom: 10px; gap: 7px; font-size: 7px; }
   .metric-strip { grid-template-columns: repeat(2, 1fr); }
   .metric-cell:nth-child(2), .metric-cell:nth-child(4) { border-right: 0; }

@@ -24,6 +24,7 @@ import {
   type ZoneId,
 } from './data';
 import { availableReplicaCount, replicaHealth } from './availability';
+import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './faults';
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
 
@@ -32,6 +33,7 @@ type Source = 'ui' | 'webmcp' | 'sim';
 interface NodeMetric {
   demandRps: number;
   servedRps: number;
+  baseServedRps: number;
   capacity: number;
   utilisation: number;
   queueDepth?: number;
@@ -41,6 +43,9 @@ interface NodeMetric {
   provisionedReplicas: number;
   availableReplicas: number;
   replicaZones: ZoneId[];
+  injectedLatencyMs: number;
+  dropoutPercent: number;
+  dropoutRps: number;
   capacityModel?: {
     concurrency: number;
     serviceTimeMs: number;
@@ -54,6 +59,8 @@ interface EdgeMetric {
   rps: number;
   droppedRps: number;
   health: Health;
+  injectedLatencyMs: number;
+  dropoutPercent: number;
 }
 
 interface SimResult {
@@ -98,6 +105,7 @@ interface State {
   readReplicaAdded: boolean;
   replicaOverrides: Record<string, number>;
   batching: Record<string, { maxBatch: number; waitMs: number }>;
+  faults: Record<string, FaultProfile>;
   nodeMetrics: Record<string, NodeMetric>;
   edgeMetrics: Record<string, EdgeMetric>;
   sim: SimResult;
@@ -175,6 +183,7 @@ function createInitialState(architecture: ArchitectureDefinition): State {
     readReplicaAdded: false,
     replicaOverrides: defaultReplicas(architecture),
     batching: {},
+    faults: {},
     nodeMetrics: {},
     edgeMetrics: {},
     sim: {
@@ -212,6 +221,31 @@ function zonesForRegion(region: Region): ZoneId[] {
 
 function zonesForArchitecture(architecture: ArchitectureDefinition) {
   return Array.from(new Set(architecture.nodes.flatMap((node) => node.replicaZones ?? [])));
+}
+
+function gcpResourceProfile(architecture: ArchitectureDefinition, node: NodeDefinition) {
+  const product = node.kind === 'client' ? 'External clients'
+    : node.kind === 'edge' ? 'Cloud Load Balancing + Cloud Armor'
+      : node.kind === 'gateway' ? architecture.id === 'multi_region_saas' ? 'Cloud Run ingress + serverless NEG' : 'API Gateway'
+        : node.kind === 'service' ? 'Cloud Run'
+          : node.kind === 'queue' ? 'Pub/Sub'
+            : node.kind === 'db' ? 'Cloud SQL for PostgreSQL'
+              : node.kind === 'cache' ? 'Memorystore for Redis'
+                : 'Vertex AI Endpoint';
+  const scope = node.kind === 'edge' || node.kind === 'client' ? 'global'
+    : node.replicaZones?.length ? `${node.region} / ${new Set(node.replicaZones).size}-zone`
+      : `${node.region} / managed regional`;
+  const plane = node.kind === 'client' || node.kind === 'edge' || node.kind === 'gateway' ? 'edge / ingress'
+    : node.kind === 'service' || node.kind === 'gpu' ? 'compute / serving'
+      : node.kind === 'queue' ? 'messaging / delivery'
+        : 'state / data';
+  return { product, scope, plane };
+}
+
+function architecturePlanes(architecture: ArchitectureDefinition) {
+  if (architecture.id === 'event_driven_checkout') return ['EDGE / API', 'ORDER / EVENT', 'PAYMENT / STATE'];
+  if (architecture.id === 'multi_region_saas') return ['GLOBAL EDGE', 'REGIONAL COMPUTE', 'DATA / REPLICATION'];
+  return ['EDGE / API', 'ROUTING / SERVING', 'CACHE / OVERFLOW'];
 }
 
 function replicaPlacementsFor(state: State, node: NodeDefinition) {
@@ -253,15 +287,18 @@ function addEdgeMetrics(
   for (const edge of architecture.edges) {
     const from = nodeMetrics[edge.from];
     const to = nodeMetrics[edge.to];
-    const rps = Math.min(from?.servedRps ?? 0, to?.demandRps ?? 0);
-    const droppedRps = Math.max(0, (to?.demandRps ?? 0) - (to?.servedRps ?? 0));
+    const fault = state.faults[edge.id] ?? { latencyMs: 0, dropoutPercent: 0 };
+    const baseRps = Math.min(from?.servedRps ?? 0, to?.demandRps ?? 0);
+    const faultDroppedRps = baseRps * fault.dropoutPercent / 100;
+    const rps = Math.max(0, baseRps - faultDroppedRps);
+    const droppedRps = Math.max(0, (to?.demandRps ?? 0) - (to?.servedRps ?? 0)) + faultDroppedRps;
     const health: Health =
       from?.effectiveHealth === 'down' || to?.effectiveHealth === 'down'
         ? 'down'
-        : state.stressActive && (droppedRps > 0 || (to?.utilisation ?? 0) > 0.9)
+        : fault.latencyMs > 0 || fault.dropoutPercent > 0 || state.stressActive && (droppedRps > 0 || (to?.utilisation ?? 0) > 0.9)
           ? 'degraded'
           : 'healthy';
-    edgeMetrics[edge.id] = { rps, droppedRps, health };
+    edgeMetrics[edge.id] = { rps, droppedRps, health, injectedLatencyMs: fault.latencyMs, dropoutPercent: fault.dropoutPercent };
   }
   return edgeMetrics;
 }
@@ -286,6 +323,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     let queueDepth = 0;
     let overflowRps = 0;
     let ttftMs: number | undefined;
+    const fault = state.faults[node.id] ?? { latencyMs: 0, dropoutPercent: 0 };
 
     if (architecture.id === 'event_driven_checkout' && node.id === 'pubsub_ordered') {
       capacity = Math.min(300 * state.orderingKeyShards * state.pubsubBatch, 45000);
@@ -347,15 +385,19 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     }
 
     if (health === 'down') served = 0;
+    const baseServedRps = served;
+    const dropoutRps = baseServedRps * fault.dropoutPercent / 100;
+    served = Math.max(0, baseServedRps - dropoutRps);
     const activeDemand = state.stressActive ? demand : 0;
     const activeServed = state.stressActive ? served : 0;
     const utilisation = activeDemand > 0 ? Math.min(1.5, activeDemand / Math.max(capacity, 1)) : 0;
     const effectiveHealth: Health =
-      health === 'down' ? 'down' : health === 'degraded' || state.stressActive && utilisation > 0.9 ? 'degraded' : 'healthy';
+      health === 'down' ? 'down' : health === 'degraded' || fault.latencyMs > 0 || fault.dropoutPercent > 0 || state.stressActive && utilisation > 0.9 ? 'degraded' : 'healthy';
 
     nodeMetrics[node.id] = {
       demandRps: activeDemand,
       servedRps: activeServed,
+      baseServedRps: state.stressActive ? baseServedRps : 0,
       capacity,
       utilisation,
       queueDepth: queueDepth || undefined,
@@ -365,6 +407,9 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       provisionedReplicas,
       availableReplicas: health === 'down' ? 0 : replicas,
       replicaZones,
+      injectedLatencyMs: fault.latencyMs,
+      dropoutPercent: fault.dropoutPercent,
+      dropoutRps: state.stressActive ? dropoutRps : 0,
       capacityModel: node.capacityModel ? {
         concurrency: node.capacityModel.concurrency,
         serviceTimeMs: node.capacityModel.serviceTimeMs,
@@ -378,7 +423,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   if (architecture.id === 'event_driven_checkout') {
     const queue = nodeMetrics.pubsub_ordered;
     const db = nodeMetrics.cloud_sql;
-    rpsAchieved = Math.min(queue?.servedRps ?? state.peakRps, db?.servedRps ?? state.peakRps);
+    rpsAchieved = Math.min(queue?.baseServedRps ?? state.peakRps, db?.baseServedRps ?? state.peakRps);
     if (state.stressActive && queue?.overflowRps) {
       availability = rpsAchieved / Math.max(state.peakRps, 1);
       errorRate = 1 - availability;
@@ -390,7 +435,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   } else if (architecture.id === 'multi_region_saas') {
     const regionA = nodeMetrics.app_europe;
     const regionB = nodeMetrics.app_us;
-    rpsAchieved = (regionA?.servedRps ?? 0) + (regionB?.servedRps ?? 0);
+    rpsAchieved = (regionA?.baseServedRps ?? 0) + (regionB?.baseServedRps ?? 0);
     if (state.stressActive || state.failedRegions.length > 0) {
       availability = rpsAchieved / Math.max(state.peakRps, 1);
       errorRate = 1 - availability;
@@ -400,7 +445,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   } else {
     const oldPool = nodeMetrics.vertex_stable;
     const newPool = nodeMetrics.vertex_rc;
-    rpsAchieved = (oldPool?.servedRps ?? 0) + (newPool?.servedRps ?? 0);
+    rpsAchieved = (oldPool?.baseServedRps ?? 0) + (newPool?.baseServedRps ?? 0);
     if (state.stressActive) {
       availability = rpsAchieved / Math.max(state.peakRps, 1);
       errorRate = 1 - availability;
@@ -411,6 +456,32 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
 
   if (state.failedRegions.length > 0 && architecture.id === 'multi_region_saas') {
     breachReasons.push('REGION FAILURE');
+  }
+  const edgeMetrics = addEdgeMetrics(state, architecture, nodeMetrics);
+  if (state.stressActive) {
+    const weightedFaults = [
+      ...architecture.nodes.flatMap((node) => {
+        const fault = state.faults[node.id];
+        const metric = nodeMetrics[node.id];
+        if (!fault || !metric || fault.latencyMs === 0 && fault.dropoutPercent === 0) return [];
+        const isNonCriticalLlmSupport = architecture.id === 'llm_inference_serving' && ['memorystore', 'pubsub_overflow'].includes(node.id);
+        const trafficShare = isNonCriticalLlmSupport ? 0 : Math.min(1, metric.demandRps / Math.max(state.peakRps, 1));
+        return [{ ...fault, trafficShare }];
+      }),
+      ...architecture.edges.flatMap((edge) => {
+        const fault = state.faults[edge.id];
+        const downstream = nodeMetrics[edge.to];
+        if (!fault || !downstream || fault.latencyMs === 0 && fault.dropoutPercent === 0) return [];
+        return [{ ...fault, trafficShare: Math.min(1, downstream.demandRps / Math.max(state.peakRps, 1)) }];
+      }),
+    ];
+    const faultImpact = aggregateFaultImpact(weightedFaults);
+    availability = Math.max(0, Math.min(1, availability * faultImpact.availabilityMultiplier));
+    rpsAchieved = Math.max(0, rpsAchieved * faultImpact.availabilityMultiplier);
+    p95Ms += Math.round(faultImpact.latencyMs);
+    errorRate = 1 - availability;
+    if (faultImpact.latencyMs > 0 && p95Ms > state.latencyTarget) breachReasons.push('INJECTED LATENCY');
+    if (faultImpact.availabilityMultiplier < 1 && availability < state.availabilityTarget) breachReasons.push('INJECTED DROPOUT');
   }
   if (state.stressActive && cost > state.budget) breachReasons.push('BUDGET LIMIT');
   if (!state.stressActive) breachReasons.push('SLO NOT TESTED');
@@ -427,7 +498,6 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     breachReasons,
   });
 
-  const edgeMetrics = addEdgeMetrics(state, architecture, nodeMetrics);
   return {
     ...state,
     nodeMetrics,
@@ -570,9 +640,11 @@ function makeTools(
             replicaZones: replicaPlacementsFor(state, node),
             provisionedReplicas: replicasFor(state, node),
             availableReplicas: activeReplicasFor(state, node),
+            gcp: gcpResourceProfile(architecture, node),
+            fault: state.faults[node.id] ?? null,
             health: state.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy',
           })),
-          edges: architecture.edges,
+          edges: architecture.edges.map((edge) => ({ ...edge, fault: state.faults[edge.id] ?? null })),
           failedRegions: state.failedRegions,
           failedZones: state.failedZones,
           excludedRegions: state.pins.includes('no_second_region') ? ['us-east4'] : [],
@@ -597,6 +669,7 @@ function makeTools(
           availabilityTarget: state.availabilityTarget,
           latencyTargetMs: state.latencyTarget,
           pins: state.pins,
+          activeFaults: state.faults,
           primaryTrafficPercent: architecture.id === 'multi_region_saas' ? state.regionPrimaryPercent : undefined,
           newModelPercent: architecture.id === 'llm_inference_serving' ? state.modelNewPercent : undefined,
           storeVersion: state.version,
@@ -615,6 +688,7 @@ function makeTools(
           const items: Record<string, unknown>[] = [];
           if (metric.utilisation > 1) items.push({ code: 'CAPACITY_BREACH', nodeId: node.id, demand: metric.demandRps, capacity: metric.capacity, unit: 'req/s' });
           if ((metric.queueDepth ?? 0) > 0 || (metric.overflowRps ?? 0) > 0) items.push({ code: 'QUEUE_PRESSURE', nodeId: node.id, depth: metric.queueDepth ?? 0, overflow: metric.overflowRps ?? 0, unit: 'req/s' });
+          if (metric.injectedLatencyMs > 0 || metric.dropoutPercent > 0) items.push({ code: 'INJECTED_FAULT', nodeId: node.id, latencyMs: metric.injectedLatencyMs, dropoutPercent: metric.dropoutPercent, dropoutRps: metric.dropoutRps });
           return items;
         });
         return read('get_live_metrics', {}, {
@@ -678,6 +752,24 @@ function makeTools(
       description: 'Restore one failed availability zone and its placed replicas.',
       inputSchema: toolInputSchema({ zone: { type: 'string', enum: zonesForArchitecture(architecture) }, expectedVersion: { type: 'number' } }, ['zone', 'expectedVersion']),
       execute: (input) => invoke('restore_zone', { zone: String(input.zone) }, Number(input.expectedVersion)),
+    },
+    {
+      name: 'set_fault_profile',
+      description: 'Inject deterministic latency and request dropout at any declared component or connection in this architecture.',
+      inputSchema: toolInputSchema({ targetId: { type: 'string', enum: [...architecture.nodes.map((node) => node.id), ...architecture.edges.map((edge) => edge.id)] }, latencyMs: { type: 'number', minimum: 0, maximum: 30000 }, dropoutPercent: { type: 'number', minimum: 0, maximum: 100 }, expectedVersion: { type: 'number' } }, ['targetId', 'latencyMs', 'dropoutPercent', 'expectedVersion']),
+      execute: (input) => invoke('set_fault_profile', { targetId: String(input.targetId), latencyMs: Number(input.latencyMs), dropoutPercent: Number(input.dropoutPercent) }, Number(input.expectedVersion)),
+    },
+    {
+      name: 'clear_fault_profile',
+      description: 'Clear injected latency and dropout from one component or connection.',
+      inputSchema: toolInputSchema({ targetId: { type: 'string', enum: [...architecture.nodes.map((node) => node.id), ...architecture.edges.map((edge) => edge.id)] }, expectedVersion: { type: 'number' } }, ['targetId', 'expectedVersion']),
+      execute: (input) => invoke('clear_fault_profile', { targetId: String(input.targetId) }, Number(input.expectedVersion)),
+    },
+    {
+      name: 'clear_all_faults',
+      description: 'Clear every injected latency and dropout profile while preserving load, scaling, traffic split, pins, and zone state.',
+      inputSchema: toolInputSchema({ expectedVersion: { type: 'number' } }, ['expectedVersion']),
+      execute: (input) => invoke('clear_all_faults', {}, Number(input.expectedVersion)),
     },
   ];
 
@@ -818,6 +910,24 @@ function runCommandFor(
     if (op === 'restore_zone') {
       const zone = args.zone as ZoneId;
       return { state: applyMetrics({ ...state, failedZones: state.failedZones.filter((item) => item !== zone) }, architecture), result: { zone } };
+    }
+    if (op === 'set_fault_profile') {
+      const targetId = String(args.targetId);
+      const validTarget = architecture.nodes.some((node) => node.id === targetId) || architecture.edges.some((edge) => edge.id === targetId);
+      if (!validTarget) return { state, result: { ok: false, code: 'UNKNOWN_FAULT_TARGET', message: `Unknown component or connection ${targetId}.` } };
+      const fault = normalizeFault(Number(args.latencyMs), Number(args.dropoutPercent));
+      const faults = fault.latencyMs === 0 && fault.dropoutPercent === 0
+        ? Object.fromEntries(Object.entries(state.faults).filter(([id]) => id !== targetId))
+        : { ...state.faults, [targetId]: fault };
+      return { state: applyMetrics({ ...state, faults, running: true, stressActive: true }, architecture), result: { targetId, ...fault } };
+    }
+    if (op === 'clear_fault_profile') {
+      const targetId = String(args.targetId);
+      const faults = Object.fromEntries(Object.entries(state.faults).filter(([id]) => id !== targetId));
+      return { state: applyMetrics({ ...state, faults }, architecture), result: { targetId } };
+    }
+    if (op === 'clear_all_faults') {
+      return { state: applyMetrics({ ...state, faults: {} }, architecture), result: { cleared: Object.keys(state.faults).length } };
     }
     if (op === 'kill_component') {
       const id = String(args.id);
@@ -1180,10 +1290,11 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
   return <div ref={mountRef} className="topology-signal-field" aria-hidden="true" />;
 }
 
-function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: { architecture: ArchitectureDefinition; state: State; selectedNodeId: string | null; onSelectNode: (id: string) => void }) {
+function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, invoke }: { architecture: ArchitectureDefinition; state: State; selectedNodeId: string | null; onSelectNode: (id: string) => void; invoke: (op: string, args: Record<string, unknown>) => DomainResult }) {
   const selectedNode = architecture.nodes.find((node) => node.id === selectedNodeId);
   const nodeMap = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture.nodes]);
   const availabilityZones = zonesForArchitecture(architecture);
+  const planes = architecturePlanes(architecture);
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1201,6 +1312,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
         const failed = state.failedZones.includes(zone);
         return <div className={`availability-zone ${failed ? 'failed' : ''}`} key={zone}><span>{zone}</span><b>{failed ? 'FAILED' : 'HEALTHY'}</b><small>{failed ? 0 : placements}/{placements} replicas available</small></div>;
       })}</div>
+      <div className="service-planes" aria-hidden="true">{planes.map((plane) => <div key={plane}><span>{plane}</span></div>)}</div>
       {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
       <TopologySignalField architecture={architecture} state={state} />
       <svg className="graph-edges" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
@@ -1215,29 +1327,34 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
         const health = metric?.effectiveHealth ?? 'healthy';
         const isSelected = node.id === selectedNodeId;
         return (
-          <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.lastMutation?.op.includes(node.id) ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
+          <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.faults[node.id] ? 'fault-active' : ''} ${state.lastMutation?.op.includes(node.id) ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
             <span className="node-top"><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
             <strong>{node.name}</strong>
             {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
+            {state.faults[node.id] ? <span className="fault-mark">FAULT · +{state.faults[node.id].latencyMs} ms · {state.faults[node.id].dropoutPercent}% drop</span> : null}
             <span className="node-stats"><span>{metric ? `${formatNumber(metric.utilisation * 100, 0)}%` : '--'} util</span><span>{healthLabel(health)}</span></span>
           </button>
         );
       })}
       <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />saturated flow</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
       </div>
-      {selectedNode && <NodeInspector node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} onClose={() => onSelectNode('')} />}
+      {selectedNode && <NodeInspector architecture={architecture} node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} invoke={invoke} onClose={() => onSelectNode('')} />}
     </div>
   );
 }
 
-function NodeInspector({ node, metric, state, onClose }: { node: NodeDefinition; metric?: NodeMetric; state: State; onClose: () => void }) {
+function NodeInspector({ architecture, node, metric, state, invoke, onClose }: { architecture: ArchitectureDefinition; node: NodeDefinition; metric?: NodeMetric; state: State; invoke: (op: string, args: Record<string, unknown>) => DomainResult; onClose: () => void }) {
+  const resource = gcpResourceProfile(architecture, node);
+  const fault = state.faults[node.id];
   return (
     <aside className="node-inspector" aria-label={`${node.name} inspector`}>
       <div className="inspector-head"><div><span className="eyebrow">NODE INSPECTOR</span><h3>{node.name}</h3></div><button className="icon-button" onClick={onClose} aria-label="Close inspector"><span className="close-mark" aria-hidden="true" /></button></div>
-      <dl><div><dt>Kind</dt><dd>{node.kind}</dd></div><div><dt>Region</dt><dd>{node.region}</dd></div><div><dt>Replica spread</dt><dd>{metric?.replicaZones.length ? metric.replicaZones.map(zoneShortLabel).join(' · ') : 'regional / managed'}</dd></div><div><dt>Replicas available</dt><dd>{metric ? `${metric.availableReplicas} / ${metric.provisionedReplicas}` : state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
+      <dl><div><dt>GCP product</dt><dd>{resource.product}</dd></div><div><dt>Service plane</dt><dd>{resource.plane}</dd></div><div><dt>Scope</dt><dd>{resource.scope}</dd></div><div><dt>Replica spread</dt><dd>{metric?.replicaZones.length ? metric.replicaZones.map(zoneShortLabel).join(' · ') : 'provider managed'}</dd></div><div><dt>Replicas available</dt><dd>{metric ? `${metric.availableReplicas} / ${metric.provisionedReplicas}` : state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
       {metric?.queueDepth !== undefined && <p className="inspector-note">Queue depth <b>{formatNumber(metric.queueDepth)}</b> · overflow <b>{formatNumber(metric.overflowRps ?? 0)} req/s</b></p>}
       {metric?.ttftMs !== undefined && <p className="inspector-note">TTFT <b>{formatNumber(metric.ttftMs)} ms</b> · model assumption</p>}
       {metric?.capacityModel && <div className="capacity-equation" aria-label="Capacity model"><span>Capacity model</span><code>{state.replicaOverrides[node.id] ?? node.replicas} replicas × {metric.capacityModel.concurrency} concurrent × 1,000/{metric.capacityModel.serviceTimeMs} ms × {formatNumber(metric.capacityModel.schedulingEfficiency * 100)}% scheduler × {formatNumber(metric.capacityModel.batchGain, 2)} batch</code><small>{formatNumber(metric.capacityModel.reserveRps)} req/s operational reserve shown separately from available headroom.</small></div>}
+      <div className={`fault-readout ${fault ? 'active' : ''}`}><span>Injected fault profile</span><code>{fault ? `+${fault.latencyMs} ms latency · ${fault.dropoutPercent}% dropout` : 'none'}</code><small>WebMCP target: {node.id}</small></div>
+      <div className="fault-presets" aria-label="Fault injection presets"><button onClick={() => invoke('set_fault_profile', { targetId: node.id, latencyMs: 200, dropoutPercent: fault?.dropoutPercent ?? 0 })}>Inject +200 ms</button><button onClick={() => invoke('set_fault_profile', { targetId: node.id, latencyMs: fault?.latencyMs ?? 0, dropoutPercent: 5 })}>Inject 5% drop</button><button disabled={!fault} onClick={() => invoke('clear_fault_profile', { targetId: node.id })}>Clear fault</button></div>
       <p className="inspector-source">limits / model assumption / 2026-08-27</p>
     </aside>
   );
@@ -1268,6 +1385,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
       : { label: 'Release endpoint', value: `${formatNumber((state.nodeMetrics.vertex_rc?.utilisation ?? 0) * 100, 0)}% util`, note: `${formatNumber(state.nodeMetrics.vertex_rc?.ttftMs ?? 350)} ms TTFT` };
   const pins: PinId[] = architecture.id === 'event_driven_checkout' ? ['keep_pubsub_ordering', 'budget_hard'] : architecture.id === 'multi_region_saas' ? ['no_second_region', 'budget_hard'] : ['keep_old_model', 'budget_hard'];
   const availabilityZones = zonesForArchitecture(architecture);
+  const activeFaults = Object.entries(state.faults);
   return (
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
@@ -1278,6 +1396,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
         {architecture.id === 'llm_inference_serving' && <RangeControl label="New model traffic" value={state.modelNewPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_model_traffic_split', { newModelPercent: value })} />}
       </section>
       <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><p>Fail one zone to remove only the replicas placed there. Surviving replicas keep serving at reduced capacity.</p><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
+      <section className="rail-section rail-faults"><div className="section-title"><span>Fault injection</span><span className={activeFaults.length ? 'readout-status bad' : 'pin-count'}>{activeFaults.length} active</span></div><p>WebMCP can target any component or connection with latency and request dropout. Effects are traffic-weighted and recorded in the FDR.</p>{activeFaults.length ? <div className="fault-list">{activeFaults.map(([targetId, fault]) => <div key={targetId}><code>{targetId}</code><span>+{formatNumber(fault.latencyMs)} ms · {formatNumber(fault.dropoutPercent, 2)}% drop</span></div>)}<button onClick={() => invoke('clear_all_faults', {})}>Clear all injected faults</button></div> : <div className="fault-empty"><span>NO ACTIVE FAULTS</span><small>Tools: set_fault_profile · clear_fault_profile</small></div>}</section>
       <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><p>Constraints are domain invariants. The graph stays visible when a region or model is excluded.</p><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
       <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
       <section className="rail-section rail-reference"><div className="section-title"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a></div><p>{architecture.referenceSpec}</p></section>
@@ -1378,7 +1497,7 @@ function BenchView({ architectureId }: { architectureId: string }) {
     <main className="app-shell bench-shell">
       <header className="topbar bench-topbar"><a href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</a><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>{architecture.platform} / {architecture.name.toUpperCase()} / LIVE BENCH</small></span></div><div className="topbar-status"><span className="version-readout">SHARED STATE / v{state.version}</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div></header>
       <div className="bench-layout">
-        <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.platform} / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>{architecture.platform} REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} /></div><MetricStrip state={state} architecture={architecture} /><div className="proof-band"><div><strong>One bench. Two operators. No silent overwrite.</strong><p>Change a normal control while tools are active. The version moves, the stale write is rejected, and the next legal move has to read the new state.</p></div><div className="proof-mark"><span className="proof-square" /><span>live controls stay open</span></div></div></section>
+        <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.platform} / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>{architecture.platform} REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} invoke={invoke} /></div><MetricStrip state={state} architecture={architecture} /><div className="proof-band"><div><strong>One bench. Two operators. No silent overwrite.</strong><p>Change a normal control while tools are active. The version moves, the stale write is rejected, and the next legal move has to read the new state.</p></div><div className="proof-mark"><span className="proof-square" /><span>live controls stay open</span></div></div></section>
         <ScenarioRail architecture={architecture} state={state} toolStatus={toolStatus} toolCount={toolCount} invoke={invoke} />
       </div>
       <FdrTicker entries={state.log} />
