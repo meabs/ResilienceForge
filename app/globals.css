@@ -60,7 +60,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .site-tools-lamp.red .lamp-dot { background: var(--red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 14%, transparent); }
 .site-tools-lamp.red b { color: var(--red); }
 
-.catalogue-hero { max-width: 1420px; margin: 0 auto; padding: clamp(62px, 9vw, 126px) 48px 54px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 410px); gap: 80px; align-items: end; }
+.catalogue-hero { max-width: 1500px; margin: 0 auto; padding: clamp(42px, 5vw, 72px) 32px 36px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 360px); gap: 56px; align-items: end; }
 .eyebrow { margin: 0 0 17px; color: var(--orange); font-family: var(--font-mono); font-size: 10px; letter-spacing: .16em; line-height: 1.4; text-transform: uppercase; }
 .hero-copy h1 { max-width: 840px; margin: 0; color: var(--paper); font-size: clamp(48px, 7vw, 94px); font-weight: 600; letter-spacing: -.065em; line-height: .94; }
 .hero-copy h1 span { color: var(--acid); font-style: italic; font-weight: 500; }
@@ -71,7 +71,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .thesis-rail b { font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em; color: var(--paper); text-transform: uppercase; }
 .thesis-rail span:not(.rail-mark) { color: var(--muted); font-size: 13px; line-height: 1.35; }
 
-.catalogue-grid { max-width: 1420px; margin: 0 auto; padding: 0 48px 64px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
+.catalogue-grid { max-width: 1500px; margin: 0 auto; padding: 0 32px 48px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
 .reference-card { --accent: var(--orange); min-width: 0; height: 100%; background: var(--steel); border: 1px solid var(--line); position: relative; display: flex; flex-direction: column; transition: border-color .2s ease, transform .2s ease, background .2s ease; }
 .reference-card::before { content: ''; position: absolute; top: -1px; left: 23px; right: 23px; height: 2px; background: var(--accent); }
 .reference-card:hover { background: #202a33; border-color: #596874; transform: translateY(-4px); }
@@ -81,7 +81,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .card-topline { min-height: 44px; padding: 14px 20px 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .card-type, .card-index { font-family: var(--font-mono); font-size: 9px; letter-spacing: .12em; color: var(--quiet); }
 .card-index { color: var(--accent); font-size: 14px; }
-.topology-thumbnail { min-height: 157px; margin: 0 20px; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); display: grid; align-content: center; gap: 12px; background: #161d23; background-image: linear-gradient(90deg, transparent 24%, #25303a 25%, transparent 25%, transparent 49%, #25303a 50%, transparent 50%, transparent 74%, #25303a 75%, transparent 75%), linear-gradient(0deg, transparent 24%, #25303a 25%, transparent 25%, transparent 49%, #25303a 50%, transparent 50%, transparent 74%, #25303a 75%, transparent 75%); background-size: 52px 52px; }
+.topology-thumbnail { min-height: 157px; margin: 0 20px; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); display: grid; align-content: center; gap: 4px; position: relative; background: #161d23; background-image: linear-gradient(90deg, transparent 24%, #25303a 25%, transparent 25%, transparent 49%, #25303a 50%, transparent 50%, transparent 74%, #25303a 75%, transparent 75%), linear-gradient(0deg, transparent 24%, #25303a 25%, transparent 25%, transparent 49%, #25303a 50%, transparent 50%, transparent 74%, #25303a 75%, transparent 75%); background-size: 52px 52px; }
+.thumbnail-gcp-icons { position: absolute; display: flex; align-items: center; justify-content: space-around; width: calc(100% - 40px); margin-top: -36px; pointer-events: none; }
+.thumbnail-gcp-icons img { width: 24px; height: 24px; object-fit: contain; filter: drop-shadow(0 2px 4px rgb(0 0 0 / 28%)); }
 .topology-thumbnail svg { width: 100%; height: 102px; }
 .topology-thumbnail svg path { fill: none; stroke: #72828d; stroke-width: 2; stroke-dasharray: 1 6; stroke-linecap: round; }
 .topology-thumbnail svg circle, .topology-thumbnail svg rect { fill: var(--steel-2); stroke: var(--accent); stroke-width: 2; }
@@ -102,7 +104,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .load-button:hover, .stress-button:hover { background: var(--accent, var(--orange)); color: #12171c; }
 .button-mark { width: 10px; height: 10px; border-top: 1px solid currentColor; border-right: 1px solid currentColor; transform: rotate(45deg); transition: transform .2s ease; }
 .load-button:hover .button-mark, .stress-button:hover .button-mark { transform: translateX(3px) rotate(45deg); }
-.catalogue-footer { max-width: 1420px; padding: 0 48px 36px; margin: 0 auto; display: flex; justify-content: space-between; gap: 16px; color: var(--quiet); font-family: var(--font-mono); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.catalogue-footer { max-width: 1500px; padding: 0 32px 30px; margin: 0 auto; display: flex; justify-content: space-between; gap: 16px; color: var(--quiet); font-family: var(--font-mono); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 
 .bench-shell { background: var(--graphite); }
 .bench-topbar { position: sticky; z-index: 20; top: 0; background: color-mix(in srgb, var(--graphite) 94%, transparent); backdrop-filter: blur(8px); }

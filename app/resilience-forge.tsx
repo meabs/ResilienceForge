@@ -1128,8 +1128,16 @@ function runCommandFor(
 
 function TopologyThumbnail({ architecture }: { architecture: ArchitectureDefinition }) {
   const mode = architecture.id;
+  const iconKinds = mode === 'event_driven_checkout'
+    ? ['client', 'gateway', 'service', 'queue', 'service']
+    : mode === 'multi_region_saas'
+      ? ['edge', 'gateway', 'service', 'db', 'cache']
+      : ['client', 'gateway', 'service', 'gpu', 'gpu'];
   return (
     <div className={`topology-thumbnail ${mode}`} aria-label={`${architecture.name} topology thumbnail`}>
+      <div className="thumbnail-gcp-icons" aria-hidden="true">
+        {iconKinds.map((kind, index) => <img key={`${kind}-${index}`} src={gcpIconFor(kind as NodeDefinition['kind'])} alt="" />)}
+      </div>
       <svg viewBox="0 0 320 108" role="img" aria-hidden="true">
         {mode === 'event_driven_checkout' && (
           <>
