@@ -2,6 +2,10 @@
 
 Resilience Forge is a shared human-and-browser-agent operations bench for testing architecture references under pressure. A human loads and constrains the reference. An external browser agent stresses the live state, proposes a legal remediation, and has to recover from stale writes when the human changes the bench first.
 
+- **Live project:** [resilience-forge.gman72.chatgpt.site](https://resilience-forge.gman72.chatgpt.site/)
+- **Public source:** [github.com/meabs/ResilienceForge](https://github.com/meabs/ResilienceForge)
+- **License:** [MIT](./LICENSE)
+
 The build follows the project documents in the repository root:
 
 - three equal architecture references: event-driven checkout, multi-region SaaS, and LLM inference serving;
@@ -12,8 +16,10 @@ The build follows the project documents in the repository root:
 
 ## Run locally
 
+Requirements: Node.js 22.13 or newer and npm.
+
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
@@ -34,9 +40,25 @@ Each bench exposes availability-zone replica placement and universal WebMCP faul
 ## Build
 
 ```bash
+npm test
 npm run lint
 npm run build
+npm start
 ```
+
+The production build is emitted by Vinext for the Cloudflare Workers-compatible ChatGPT Sites runtime. The repository includes all application source, tests, styles, assets, lockfile, and hosting configuration required to reproduce the project. No secrets or external infrastructure accounts are required.
+
+## WebMCP implementation
+
+The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). Every architecture registers its live tool definitions through the standard API:
+
+```ts
+for (const tool of tools) {
+  await document.modelContext.registerTool(tool, { signal });
+}
+```
+
+Each `tool` contains the required `name`, `description`, `inputSchema`, and `execute` fields. Tools include topology and metric reads, stress tests, replica scaling, zone and region failures, universal component/connection fault injection, and evidence-based root-cause analysis. All tools share the same versioned state and Flight Data Recorder as the visible controls.
 
 The experience was designed for the [WebMCP Challenge](https://openai.com/webmcp-challenge/) with the practical design guidance from [Impeccable](https://github.com/pbakaus/impeccable).
 

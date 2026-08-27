@@ -9,20 +9,24 @@ interface ModelContext {
   registerTool: (tool: ToolRegistration, options?: { signal?: AbortSignal }) => void | Promise<void>;
 }
 
+declare global {
+  interface Document {
+    modelContext?: ModelContext;
+  }
+}
+
 export function resolveWebMcpRuntime() {
   if (typeof document === 'undefined') return null;
-  const modelContext = (document as Document & { modelContext?: ModelContext }).modelContext;
-  return modelContext ?? null;
+  return document.modelContext ?? null;
 }
 
 export async function registerWebMcpTools(
   tools: ToolRegistration[],
   signal: AbortSignal,
 ) {
-  const runtime = resolveWebMcpRuntime();
-  if (!runtime) return { supported: false, count: 0 };
+  if (!resolveWebMcpRuntime() || !document.modelContext) return { supported: false, count: 0 };
   for (const tool of tools) {
-    await runtime.registerTool(tool, { signal });
+    await document.modelContext.registerTool(tool, { signal });
   }
   return { supported: true, count: tools.length };
 }
