@@ -48,6 +48,8 @@ export interface ArchitectureDefinition {
   platform: 'GCP';
   name: string;
   eyebrow: string;
+  referenceSpec: string;
+  referenceUrl: string;
   job: string;
   operatingShape: string;
   failure: string;
@@ -68,6 +70,8 @@ export const architectures: ArchitectureDefinition[] = [
     platform: 'GCP',
     name: 'Event-driven checkout',
     eyebrow: 'ORDER / EVENT / ORDERING KEY',
+    referenceSpec: 'Pub/Sub ordering keys are limited to 1 MBps per key, with ordering guaranteed for the same key in the same region when enabled on the subscription.',
+    referenceUrl: 'https://docs.cloud.google.com/pubsub/docs/ordering',
     job: 'Keep order events in sequence while demand arrives in bursts.',
     operatingShape: '10k requests/s · Pub/Sub ordering keys · europe-west2',
     failure: 'Ordering-key throughput ceiling',
@@ -82,7 +86,7 @@ export const architectures: ArchitectureDefinition[] = [
       { id: 'web_client', kind: 'client', name: 'Web client', shortName: 'WEB', region: 'europe-west2', replicas: 1, capacityPerReplica: 30000, legalRemediations: [], x: 13, y: 45, accent: 'cyan' },
       { id: 'api_gateway', kind: 'gateway', name: 'API Gateway', shortName: 'API', region: 'europe-west2', replicas: 2, capacityPerReplica: 8000, legalRemediations: ['set_autoscaling'], x: 28, y: 45, accent: 'cyan' },
       { id: 'cloud_run_order', kind: 'service', name: 'Cloud Run / Order', shortName: 'RUN / ORDER', region: 'europe-west2', zone: 'a', replicas: 2, capacityPerReplica: 6500, legalRemediations: ['set_autoscaling'], x: 44, y: 45, accent: 'orange' },
-      { id: 'pubsub_ordered', kind: 'queue', name: 'Pub/Sub ordered subscription', shortName: 'PUB/SUB', region: 'europe-west2', zone: 'b', replicas: 1, capacityPerReplica: 300, legalRemediations: ['enable_high_throughput', 'set_batching'], x: 62, y: 45, accent: 'orange' },
+      { id: 'pubsub_ordered', kind: 'queue', name: 'Pub/Sub ordered subscription', shortName: 'PUB/SUB', region: 'europe-west2', zone: 'b', replicas: 1, capacityPerReplica: 300, legalRemediations: ['set_ordering_key_parallelism', 'set_batching'], x: 62, y: 45, accent: 'orange' },
       { id: 'cloud_run_payment', kind: 'service', name: 'Cloud Run / Payment', shortName: 'RUN / PAY', region: 'europe-west2', zone: 'b', replicas: 2, capacityPerReplica: 6000, legalRemediations: ['set_autoscaling'], x: 82, y: 45, accent: 'acid' },
       { id: 'cloud_sql', kind: 'db', name: 'Cloud SQL for PostgreSQL', shortName: 'CLOUD SQL', region: 'europe-west2', zone: 'a', replicas: 1, capacityPerReplica: 12000, legalRemediations: ['add_read_replica', 'restore_component'], x: 44, y: 76, accent: 'violet' },
       { id: 'memorystore', kind: 'cache', name: 'Memorystore for Redis', shortName: 'MEMORYSTORE', region: 'europe-west2', zone: 'b', replicas: 1, capacityPerReplica: 18000, legalRemediations: ['set_autoscaling'], x: 62, y: 76, accent: 'cyan' },
@@ -101,6 +105,8 @@ export const architectures: ArchitectureDefinition[] = [
     platform: 'GCP',
     name: 'Multi-region SaaS',
     eyebrow: 'ACTIVE / ACTIVE / CLOUD RUN',
+    referenceSpec: 'Cloud Run services are regional; a global external Application Load Balancer with regional serverless NEGs can route traffic across regions, with health checks enabling failover away from an unhealthy service.',
+    referenceUrl: 'https://docs.cloud.google.com/run/docs/multiple-regions?hl=en',
     job: 'Keep a service available when a whole region disappears.',
     operatingShape: '50 / 50 traffic · Cloud Run in two regions · 99.95% SLO',
     failure: 'Regional Cloud Run loss and traffic rebalance',
@@ -137,6 +143,8 @@ export const architectures: ArchitectureDefinition[] = [
     platform: 'GCP',
     name: 'LLM inference serving',
     eyebrow: 'RELEASE / SPLIT / VERTEX AI',
+    referenceSpec: 'Vertex AI endpoint traffic splits map deployed models to percentages that must total 100; private endpoints do not support traffic splitting.',
+    referenceUrl: 'https://docs.cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1',
     job: 'Ramp a release candidate without losing time-to-first-token.',
     operatingShape: '80 / 20 model split · Vertex AI endpoints · overflow watched',
     failure: 'Vertex AI release endpoint saturation and overflow',
@@ -171,8 +179,8 @@ export const getArchitecture = (id: string | undefined) =>
   architectures.find((architecture) => architecture.id === id) ?? architectures[0];
 
 export const limits = {
-  checkoutStandardUnbatched: { id: 'pubsub-ordered-key-standard', sourceType: 'model_assumption', value: 300, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model.' },
-  checkoutHighThroughputUnbatched: { id: 'pubsub-ordered-key-high-throughput', sourceType: 'model_assumption', value: 4500, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model.' },
+  checkoutStandardUnbatched: { id: 'pubsub-ordered-key-standard', sourceType: 'model_assumption', value: 300, unit: 'events/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model based on a 3.3 KB event profile.' },
+  checkoutHighThroughputUnbatched: { id: 'pubsub-ordered-key-parallel', sourceType: 'model_assumption', value: 4500, unit: 'events/s', sourceDate: '2026-08-27', notes: 'Synthetic 15-key parallelism model; the provider constraint remains 1 MBps per ordering key.' },
   gpuOldPerReplica: { id: 'vertex-ai-stable-capacity', sourceType: 'model_assumption', value: 120, unit: 'inference/s', sourceDate: '2026-08-27', notes: 'Synthetic Vertex AI serving model.' },
   gpuNewPerReplica: { id: 'vertex-ai-release-capacity', sourceType: 'model_assumption', value: 80, unit: 'inference/s', sourceDate: '2026-08-27', notes: 'Synthetic Vertex AI serving model.' },
 } as const;

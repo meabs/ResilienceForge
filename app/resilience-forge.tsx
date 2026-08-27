@@ -25,7 +25,6 @@ import {
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
 
 type Source = 'ui' | 'webmcp' | 'sim';
-type PubSubMode = 'standard' | 'high_throughput';
 
 interface NodeMetric {
   demandRps: number;
@@ -76,7 +75,7 @@ interface State {
   pins: PinId[];
   running: boolean;
   stressActive: boolean;
-  pubsubMode: PubSubMode;
+  orderingKeyShards: number;
   pubsubBatch: number;
   regionPrimaryPercent: number;
   modelNewPercent: number;
@@ -153,7 +152,7 @@ function createInitialState(architecture: ArchitectureDefinition): State {
     pins: [],
     running: false,
     stressActive: false,
-    pubsubMode: 'standard' as PubSubMode,
+    orderingKeyShards: 1,
     pubsubBatch: 1,
     regionPrimaryPercent: 50,
     modelNewPercent: 20,
@@ -243,8 +242,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     let ttftMs: number | undefined;
 
     if (architecture.id === 'event_driven_checkout' && node.id === 'pubsub_ordered') {
-      const unit = state.pubsubMode === 'standard' ? 300 : 4500;
-      capacity = Math.min(unit * state.pubsubBatch, state.pubsubMode === 'standard' ? 3000 : 45000);
+      capacity = Math.min(300 * state.orderingKeyShards * state.pubsubBatch, 45000);
       if (state.stressActive) {
         served = Math.min(demand, capacity);
         overflowRps = Math.max(0, demand - served);
@@ -254,7 +252,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
           p95Ms = Math.max(p95Ms, Math.round(220 + (overflowRps / Math.max(demand, 1)) * 1100));
         }
       }
-      cost += state.pubsubMode === 'high_throughput' ? 650 : 0;
+      cost += state.orderingKeyShards > 1 ? 650 : 0;
     }
 
     if (architecture.id === 'event_driven_checkout' && node.id === 'cloud_sql' && health === 'down') {
@@ -502,6 +500,8 @@ function makeTools(
         const result = read('get_architecture', {}, {
           architectureId: architecture.id,
           platform: architecture.platform,
+          referenceSpec: architecture.referenceSpec,
+          referenceUrl: architecture.referenceUrl,
           nodes: architecture.nodes.map((node) => ({
             id: node.id,
             name: node.name,
@@ -527,6 +527,8 @@ function makeTools(
         return read('get_scenario', {}, {
           architectureId: architecture.id,
           platform: architecture.platform,
+          referenceSpec: architecture.referenceSpec,
+          referenceUrl: architecture.referenceUrl,
           peakRps: state.peakRps,
           budgetGbp: state.budget,
           availabilityTarget: state.availabilityTarget,
@@ -569,15 +571,23 @@ function makeTools(
         provider: architecture.platform,
         constraints: architecture.id === 'event_driven_checkout'
           ? [
-              { id: 'pubsub-ordered-key-standard', sourceType: 'model_assumption', metric: 'Pub/Sub ordered delivery', value: 300, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model.' },
-              { id: 'pubsub-ordered-key-high-throughput', sourceType: 'model_assumption', metric: 'Pub/Sub ordered delivery', value: 4500, unit: 'operations/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model.' },
+              { id: 'pubsub-ordering-key-throughput', sourceType: 'provider_limit', metric: 'Publisher throughput per ordering key', value: 1, unit: 'MB/s', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/pubsub/docs/quotas', notes: 'Google documents a 1 MBps publishing limit for each ordering key.' },
+              { id: 'pubsub-ordering-key-scope', sourceType: 'provider_behavior', metric: 'Ordering guarantee', value: 'same key / same region / ordering enabled', unit: 'configuration', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/pubsub/docs/ordering', notes: 'Related messages must use the same key and publish region.' },
+              { id: 'pubsub-bench-event-rate', sourceType: 'model_assumption', metric: 'Bench ordered events', value: 300, unit: 'events/s/key', sourceDate: '2026-08-27', notes: 'Synthetic 3.3 KB event profile used to make the provider limit interactive.' },
             ]
           : architecture.id === 'llm_inference_serving'
             ? [
-                { id: 'vertex-ai-stable-capacity', sourceType: 'model_assumption', metric: 'Vertex AI stable endpoint capacity', value: 120, unit: 'inference/s/replica', sourceDate: '2026-08-27' },
-                { id: 'vertex-ai-release-capacity', sourceType: 'model_assumption', metric: 'Vertex AI release endpoint capacity', value: 80, unit: 'inference/s/replica', sourceDate: '2026-08-27' },
+                { id: 'vertex-ai-traffic-split', sourceType: 'provider_behavior', metric: 'Endpoint traffic split', value: 100, unit: '% total', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1', notes: 'Deployed-model percentages must add up to 100.' },
+                { id: 'api-gateway-payload-size', sourceType: 'provider_limit', metric: 'API Gateway request / response size', value: 32, unit: 'MB', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/api-gateway/docs/quotas', notes: 'Streaming is not supported through API Gateway.' },
+                { id: 'vertex-ai-stable-capacity', sourceType: 'model_assumption', metric: 'Vertex AI stable endpoint capacity', value: 120, unit: 'inference/s/replica', sourceDate: '2026-08-27', notes: 'Synthetic serving capacity; verify against the selected model and machine type.' },
+                { id: 'vertex-ai-release-capacity', sourceType: 'model_assumption', metric: 'Vertex AI release endpoint capacity', value: 80, unit: 'inference/s/replica', sourceDate: '2026-08-27', notes: 'Synthetic serving capacity; verify against the selected model and machine type.' },
               ]
-            : [{ id: 'regional-capacity', sourceType: 'model_assumption', metric: 'app capacity', value: 1900, unit: 'requests/s/replica', sourceDate: '2026-08-27' }],
+            : [
+                { id: 'cloud-run-concurrency', sourceType: 'provider_limit', metric: 'Maximum concurrency per instance', value: 1000, unit: 'concurrent requests', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/run/docs/configuring', notes: 'The benchmark capacity is still a workload assumption, not a direct RPS conversion.' },
+                { id: 'cloud-run-request-timeout', sourceType: 'provider_limit', metric: 'Maximum request timeout', value: 60, unit: 'minutes', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/run/docs/configuring/request-timeout' },
+                { id: 'cloud-sql-cross-region-replica', sourceType: 'provider_behavior', metric: 'Cross-region replication', value: 'asynchronous', unit: 'replication mode', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/sql/docs/postgres/intro-to-cloud-sql-disaster-recovery?hl=en', notes: 'Promotion is intentional; regional failover can have non-zero RPO.' },
+                { id: 'memorystore-standard-ha', sourceType: 'provider_behavior', metric: 'Memorystore Standard Tier', value: 99.9, unit: '% availability SLA', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/memorystore/docs/redis/memorystore-for-redis-overview', notes: 'Cross-zone replication and automatic failover; up to five read replicas when enabled.' },
+              ],
         publicListPriceEstimate: { gbpMonth: stateFor(getState()).sim.costGbpMonth, sourceDate: '2026-08-27', assumptions: ['Curated estimate', 'Synthetic replica mix'] },
         storeVersion: getState().version,
       }),
@@ -611,10 +621,10 @@ function makeTools(
         execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
       },
       {
-        name: 'enable_high_throughput',
-        description: 'Enable the higher-throughput Pub/Sub ordering-key mode while retaining ordered semantics.',
-        inputSchema: toolInputSchema({ id: { type: 'string' }, enabled: { type: 'boolean' }, expectedVersion: { type: 'number' } }, ['id', 'enabled', 'expectedVersion']),
-        execute: (input) => invoke('enable_high_throughput', { id: String(input.id), enabled: Boolean(input.enabled) }, Number(input.expectedVersion)),
+        name: 'set_ordering_key_parallelism',
+        description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.',
+        inputSchema: toolInputSchema({ id: { type: 'string' }, orderingKeyShards: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'orderingKeyShards', 'expectedVersion']),
+        execute: (input) => invoke('set_ordering_key_parallelism', { id: String(input.id), orderingKeyShards: Number(input.orderingKeyShards) }, Number(input.expectedVersion)),
       },
       {
         name: 'set_batching',
@@ -744,11 +754,11 @@ function runCommandFor(
       const id = String(args.id);
       return { state: applyMetrics({ ...state, killedNodes: state.killedNodes.filter((item) => item !== id), failedRegions: state.failedRegions.filter((region) => !architecture.nodes.some((node) => node.id === id && node.region === region)) }, architecture), result: { id } };
     }
-    if (op === 'enable_high_throughput') {
+    if (op === 'set_ordering_key_parallelism') {
       const id = String(args.id);
-      if (id !== 'pubsub_ordered') return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'High-throughput mode is only legal for the ordered Pub/Sub subscription.' } };
-      const pubsubMode = Boolean(args.enabled) ? 'high_throughput' : 'standard';
-      return { state: applyMetrics({ ...state, pubsubMode }, architecture), result: { pubsubMode } };
+      if (id !== 'pubsub_ordered') return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'Ordering-key parallelism is only legal for the ordered Pub/Sub subscription.' } };
+      const orderingKeyShards = Math.min(15, Math.max(1, Math.round(Number(args.orderingKeyShards))));
+      return { state: applyMetrics({ ...state, orderingKeyShards }, architecture), result: { orderingKeyShards } };
     }
     if (op === 'set_batching') {
       const id = String(args.id);
@@ -848,6 +858,7 @@ function CatalogueView() {
               <p className="card-job">{architecture.job}</p>
               <dl className="reference-facts">
                 <div><dt>Operating shape</dt><dd>{architecture.operatingShape}</dd></div>
+                <div><dt>GCP specification</dt><dd><a className="reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">{architecture.referenceSpec}<span aria-hidden="true">↗</span></a></dd></div>
                 <div><dt>Distinctive failure</dt><dd>{architecture.failure}</dd></div>
                 <div><dt>Human interrupt</dt><dd>{architecture.interrupt}</dd></div>
               </dl>
@@ -936,7 +947,7 @@ function RangeControl({ label, value, min, max, step, suffix, onChange }: { labe
 function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { architecture: ArchitectureDefinition; state: State; toolStatus: 'off' | 'green' | 'amber' | 'red'; toolCount: number; invoke: (op: string, args: Record<string, unknown>) => DomainResult }) {
   const stressLabel = architecture.id === 'event_driven_checkout' ? 'Run Pub/Sub stress' : architecture.id === 'multi_region_saas' ? 'Fail us-east4' : 'Ramp Vertex AI endpoint';
   const scenarioMetric = architecture.id === 'event_driven_checkout'
-    ? { label: 'Ordering-key pressure', value: `${formatNumber(state.nodeMetrics.pubsub_ordered?.queueDepth ?? 0)} depth`, note: `${formatNumber(state.nodeMetrics.pubsub_ordered?.capacity ?? 0)} msg/s cap` }
+    ? { label: 'Ordering-key pressure', value: `${formatNumber(state.nodeMetrics.pubsub_ordered?.queueDepth ?? 0)} depth`, note: `${formatNumber(state.nodeMetrics.pubsub_ordered?.capacity ?? 0)} events/s model` }
     : architecture.id === 'multi_region_saas'
       ? { label: 'Traffic split', value: `${state.regionPrimaryPercent} / ${100 - state.regionPrimaryPercent}`, note: 'primary / secondary' }
       : { label: 'Release endpoint', value: `${formatNumber((state.nodeMetrics.vertex_rc?.utilisation ?? 0) * 100, 0)}% util`, note: `${formatNumber(state.nodeMetrics.vertex_rc?.ttftMs ?? 350)} ms TTFT` };
@@ -952,6 +963,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
       </section>
       <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><p>Constraints are domain invariants. The graph stays visible when a region or model is excluded.</p><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
       <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
+      <section className="rail-section rail-reference"><div className="section-title"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a></div><p>{architecture.referenceSpec}</p></section>
       <section className="rail-section rail-tools"><div className="section-title"><span>Tool surface</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div><p>{toolStatus === 'green' ? `${toolCount} architecture-specific tools registered.` : toolStatus === 'amber' ? 'Browser tools unavailable. The bench remains fully runnable.' : toolStatus === 'red' ? 'Registration needs attention.' : 'Registering on Bench.'}</p><div className="tool-note"><span className="tool-rail-mark" />same store / same version / same truth</div></section>
       <section className="rail-section provenance"><span>Model boundary</span><p>Simulation values are inspectable model assumptions. Pricing is a public list-price estimate, not a bill.</p><small>Snapshot / 2026-08-27</small></section>
     </aside>

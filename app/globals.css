@@ -94,6 +94,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .reference-facts div { padding: 12px 0; border-bottom: 1px solid var(--line-soft); display: grid; grid-template-columns: 38% minmax(0, 1fr); gap: 10px; }
 .reference-facts dt { color: var(--quiet); font-family: var(--font-mono); font-size: 9px; letter-spacing: .07em; line-height: 1.35; text-transform: uppercase; }
 .reference-facts dd { margin: 0; color: var(--paper); font-size: 12px; line-height: 1.38; }
+.reference-link { color: var(--paper); text-decoration: none; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.reference-link:hover { color: var(--cyan); text-decoration: underline; }
+.reference-link span { display: inline-block; margin-left: 6px; color: var(--cyan); font-family: var(--font-mono); font-size: 10px; }
 .load-button, .stress-button { min-height: 46px; margin-top: auto; padding: 0 15px; border: 1px solid var(--accent, var(--orange)); background: transparent; color: var(--paper); display: flex; align-items: center; justify-content: space-between; gap: 12px; font-family: var(--font-mono); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; cursor: pointer; transition: background .2s ease, color .2s ease; }
 .load-button { margin-top: 22px; }
 .load-button:hover, .stress-button:hover { background: var(--accent, var(--orange)); color: #12171c; }
@@ -235,6 +238,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .scenario-readout small { color: var(--muted); letter-spacing: .03em; text-transform: none; }
 .readout-status.good { color: var(--green); }
 .readout-status.bad { color: var(--red); }
+.rail-reference .section-title { align-items: baseline; }
+.rail-reference > p { margin-bottom: 0; }
+.rail-reference-link { color: var(--cyan); font-family: var(--font-mono); font-size: 8px; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
 .breach-list { min-height: 18px; margin-top: 12px; display: flex; flex-wrap: wrap; gap: 5px; }
 .breach-list span { padding: 4px 6px; border: 1px solid #634348; color: var(--red); font-family: var(--font-mono); font-size: 8px; letter-spacing: .06em; }
 .rail-tools .section-title { align-items: center; }
