@@ -28,6 +28,8 @@ import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './fault
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RootCauseAnalysis } from './rca';
+import { gcpTopologyFrame } from './gcp-layout';
+import { gcpIconFor } from './gcp-icons';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -162,22 +164,39 @@ function defaultReplicas(architecture: ArchitectureDefinition) {
   return Object.fromEntries(architecture.nodes.map((node) => [node.id, node.replicas]));
 }
 
-function createInitialState(architecture: ArchitectureDefinition): State {
+type SavedControls = Pick<State, 'peakRps' | 'budget' | 'regionPrimaryPercent' | 'modelNewPercent' | 'pins'>;
+
+function loadSavedControls(architectureId: string): Partial<SavedControls> | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(`resilience-forge:controls:${architectureId}`);
+    if (!raw) return null;
+    const saved = JSON.parse(raw) as Partial<SavedControls>;
+    if (saved.pins) {
+      saved.pins = saved.pins.map((pin) => pin === ('keep_fifo_ordering' as PinId) ? 'keep_pubsub_ordering' : pin);
+    }
+    return saved;
+  } catch {
+    return null;
+  }
+}
+
+function createInitialState(architecture: ArchitectureDefinition, saved?: Partial<SavedControls> | null): State {
   const state = {
     architectureId: architecture.id,
     version: 1,
     tick: 0,
-    peakRps: architecture.defaultPeakRps,
-    budget: architecture.defaultBudget,
+    peakRps: saved?.peakRps ?? architecture.defaultPeakRps,
+    budget: saved?.budget ?? architecture.defaultBudget,
     availabilityTarget: architecture.defaultAvailabilityTarget,
     latencyTarget: architecture.defaultLatencyTarget,
-    pins: [],
+    pins: saved?.pins ?? [],
     running: false,
     stressActive: false,
     orderingKeyShards: 1,
     pubsubBatch: 1,
-    regionPrimaryPercent: 50,
-    modelNewPercent: architecture.id === 'llm_inference_serving' ? 100 : 20,
+    regionPrimaryPercent: saved?.regionPrimaryPercent ?? 50,
+    modelNewPercent: saved?.modelNewPercent ?? (architecture.id === 'llm_inference_serving' ? 100 : 20),
     failedRegions: [],
     failedZones: [],
     killedNodes: [],
@@ -241,12 +260,6 @@ function gcpResourceProfile(architecture: ArchitectureDefinition, node: NodeDefi
       : node.kind === 'queue' ? 'messaging / delivery'
         : 'state / data';
   return { product, scope, plane };
-}
-
-function architecturePlanes(architecture: ArchitectureDefinition) {
-  if (architecture.id === 'event_driven_checkout') return ['EDGE / API', 'ORDER / EVENT', 'PAYMENT / STATE'];
-  if (architecture.id === 'multi_region_saas') return ['GLOBAL EDGE', 'REGIONAL COMPUTE', 'DATA / REPLICATION'];
-  return ['EDGE / API', 'ROUTING / SERVING', 'CACHE / OVERFLOW'];
 }
 
 function replicaPlacementsFor(state: State, node: NodeDefinition) {
@@ -850,6 +863,18 @@ function makeTools(
       }),
     },
     {
+      name: 'set_peak_rps',
+      description: 'Set peak load demand in requests per second for the current scenario.',
+      inputSchema: toolInputSchema({ peakRps: { type: 'number' }, expectedVersion: { type: 'number' } }, ['peakRps', 'expectedVersion']),
+      execute: (input) => invoke('set_peak_rps', { peakRps: Number(input.peakRps) }, Number(input.expectedVersion)),
+    },
+    {
+      name: 'set_budget',
+      description: 'Set the monthly budget constraint in GBP for the current scenario.',
+      inputSchema: toolInputSchema({ budget: { type: 'number' }, expectedVersion: { type: 'number' } }, ['budget', 'expectedVersion']),
+      execute: (input) => invoke('set_budget', { budget: Number(input.budget) }, Number(input.expectedVersion)),
+    },
+    {
       name: 'run_stress_test',
       description: 'Start the deterministic stress or failure path for the loaded reference.',
       inputSchema: toolInputSchema({ expectedVersion: { type: 'number' } }, ['expectedVersion']),
@@ -1424,19 +1449,12 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
 function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, invoke }: { architecture: ArchitectureDefinition; state: State; selectedNodeId: string | null; onSelectNode: (id: string) => void; invoke: (op: string, args: Record<string, unknown>) => DomainResult }) {
   const selectedNode = architecture.nodes.find((node) => node.id === selectedNodeId);
   const nodeMap = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture.nodes]);
-  const availabilityZones = zonesForArchitecture(architecture);
-  const planes = architecturePlanes(architecture);
+  const topologyFrame = useMemo(
+    () => gcpTopologyFrame(architecture, state.failedZones, state.failedRegions, state.pins),
+    [architecture, state.failedRegions, state.failedZones, state.pins],
+  );
   const hasActiveFailure = state.failedZones.length > 0 || state.failedRegions.length > 0 || state.killedNodes.length > 0 || Object.keys(state.faults).length > 0 || (state.stressActive && !state.sim.sloPass);
-  const zoneFrames = architecture.id === 'multi_region_saas'
-    ? [
-        { key: 'eu', label: 'SHARED VPC / EUROPE-WEST2', className: 'zone-frame-region zone-frame-eu' },
-        { key: 'us', label: 'SHARED VPC / US-EAST4', className: 'zone-frame-region zone-frame-us' },
-      ]
-    : [
-        { key: 'edge', label: architecture.id === 'llm_inference_serving' ? 'EDGE / API' : 'EDGE / INGRESS', className: 'zone-frame-column zone-frame-edge' },
-        { key: 'compute', label: architecture.id === 'llm_inference_serving' ? 'ROUTING / SERVING' : architecture.id === 'event_driven_checkout' ? 'ORDER / EVENT' : 'REGIONAL COMPUTE', className: 'zone-frame-column zone-frame-compute' },
-        { key: 'state', label: architecture.id === 'llm_inference_serving' ? 'CACHE / OVERFLOW' : architecture.id === 'event_driven_checkout' ? 'PAYMENT / STATE' : 'DATA / REPLICATION', className: 'zone-frame-column zone-frame-state' },
-      ];
+  const isMultiRegion = architecture.id === 'multi_region_saas';
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1450,16 +1468,30 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
       <div className={`graph-board ${architecture.id} ${hasActiveFailure ? 'failure-active' : ''}`}>
       {hasActiveFailure && <div className="failure-propagation" aria-hidden="true"><span>FAILURE PROPAGATION</span></div>}
       <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
-      <div className="availability-map" aria-label="Availability zone status">{availabilityZones.map((zone) => {
-        const placements = architecture.nodes.flatMap((node) => replicaPlacementsFor(state, node)).filter((item) => item === zone).length;
-        const failed = state.failedZones.includes(zone);
-        return <div className={`availability-zone ${failed ? 'failed' : ''}`} key={zone}><span>{zone}</span><b>{failed ? 'FAILED' : 'HEALTHY'}</b><small>{failed ? 0 : placements}/{placements} replicas available</small></div>;
-      })}</div>
-      <div className={`zone-frames zone-frames-${architecture.id}`} aria-label="Architecture zones">
-        {zoneFrames.map((zone) => <div className={zone.className} key={zone.key}><span>{zone.label}</span><small>COMPONENTS IN ZONE</small></div>)}
+      <div className={`gcp-topology-frame ${isMultiRegion ? 'gcp-topology-multi' : 'gcp-topology-regional'}`} aria-label="GCP deployment topology">
+        <div className="gcp-global-strip">
+          <span className="gcp-frame-label">{topologyFrame.globalLabel}</span>
+          <small>{topologyFrame.globalSublabel}</small>
+        </div>
+        <div className="gcp-region-stack">
+          {topologyFrame.regions.map((region) => (
+            <div className={`${region.className} ${region.failed ? 'failed' : ''}`} key={region.key}>
+              <div className="gcp-region-header">
+                <span>{region.label}</span>
+                <small>{region.sublabel}</small>
+              </div>
+              <div className="gcp-zone-row">
+                {region.zones.map((zone) => (
+                  <div className={`${zone.className} ${zone.failed ? 'failed' : ''}`} key={zone.key}>
+                    <span>{zone.label}</span>
+                    <small>{zone.sublabel}</small>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
-      <div className="service-planes" aria-hidden="true">{planes.map((plane) => <div key={plane}><span>{plane}</span></div>)}</div>
-      {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
       <TopologySignalField architecture={architecture} state={state} />
       <svg className="graph-edges" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
         <defs><marker id={`edge-arrow-${architecture.id}`} markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" /></marker></defs>
@@ -1474,7 +1506,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
         const isSelected = node.id === selectedNodeId;
         return (
           <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.faults[node.id] ? 'fault-active' : ''} ${state.lastMutation?.targetId === node.id ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
-            <span className="node-top"><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
+            <span className="node-top"><img src={gcpIconFor(node.kind)} alt="" className="gcp-node-icon" /><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
             <strong>{node.name}</strong>
             {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
             {state.faults[node.id] ? <span className="fault-mark">FAULT · +{state.faults[node.id].latencyMs} ms · {state.faults[node.id].dropoutPercent}% drop</span> : null}
@@ -1559,9 +1591,18 @@ function FdrTicker({ entries }: { entries: FdrEntry[] }) {
   return <footer className="fdr-ticker" aria-live="polite"><div className="fdr-label"><span className="fdr-signal" /> <b>FDR</b><small>FLIGHT DATA RECORDER</small></div><div className="fdr-entries">{visible.map((entry, index) => <div className={`fdr-entry ${index === visible.length - 1 ? 'latest' : ''}`} key={`${entry.ts}-${entry.op}-${index}`}><span className={`fdr-source ${sourceClass[entry.source]}`}>{entry.source}</span><span className="fdr-time">{entry.ts}</span><code>{entry.op} {compactArgs(entry.args)}</code><span className="fdr-version">v{entry.beforeVersion}&gt;{entry.afterVersion}</span><b className={`fdr-code code-${entry.resultCode.toLowerCase()}`}>{entry.resultCode}</b></div>)}</div></footer>;
 }
 
+declare global {
+  interface Window {
+    resilienceForge?: {
+      invoke: (op: string, args: Record<string, unknown>, expectedVersion?: number) => DomainResult;
+      getState: () => State;
+    };
+  }
+}
+
 function BenchView({ architectureId }: { architectureId: string }) {
   const architecture = getArchitecture(architectureId);
-  const [state, setState] = useState<State>(() => createInitialState(architecture));
+  const [state, setState] = useState<State>(() => createInitialState(architecture, loadSavedControls(architecture.id)));
   const stateRef = useRef(state);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [toolStatus, setToolStatus] = useState<'off' | 'green' | 'amber' | 'red'>('amber');
@@ -1594,17 +1635,14 @@ function BenchView({ architectureId }: { architectureId: string }) {
   }, [architecture.id, state.budget, state.modelNewPercent, state.peakRps, state.pins, state.regionPrimaryPercent]);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(`resilience-forge:controls:${architecture.id}`);
-      if (!raw) return;
-      const saved = JSON.parse(raw) as Partial<State>;
-      const savedPins = (saved.pins ?? []).map((pin) => pin === ('keep_fifo_ordering' as PinId) ? 'keep_pubsub_ordering' : pin);
-      const next = applyMetrics({ ...stateRef.current, peakRps: saved.peakRps ?? stateRef.current.peakRps, budget: saved.budget ?? stateRef.current.budget, regionPrimaryPercent: saved.regionPrimaryPercent ?? stateRef.current.regionPrimaryPercent, modelNewPercent: saved.modelNewPercent ?? stateRef.current.modelNewPercent, pins: savedPins }, architecture);
-      commit(next);
-    } catch {
-      // Ignore malformed local preferences.
-    }
-  }, [architecture, commit]);
+    window.resilienceForge = {
+      invoke: (op, args, expectedVersion) => invoke(op, args, expectedVersion, 'webmcp'),
+      getState: () => stateRef.current,
+    };
+    return () => {
+      delete window.resilienceForge;
+    };
+  }, [invoke]);
 
   useEffect(() => {
     if (!state.running) return;
@@ -1655,5 +1693,6 @@ function BenchView({ architectureId }: { architectureId: string }) {
 }
 
 export default function ResilienceForge({ view, architectureId }: { view: 'catalogue' | 'bench'; architectureId?: string }) {
-  return view === 'bench' ? <BenchView architectureId={architectureId ?? 'event_driven_checkout'} /> : <CatalogueView />;
+  const benchId = architectureId ?? 'event_driven_checkout';
+  return view === 'bench' ? <BenchView key={benchId} architectureId={benchId} /> : <CatalogueView />;
 }
