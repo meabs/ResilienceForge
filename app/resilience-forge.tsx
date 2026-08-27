@@ -27,6 +27,7 @@ import { availableReplicaCount, replicaHealth } from './availability';
 import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './faults';
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
+import { analyseRootCause, type RootCauseAnalysis } from './rca';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -110,7 +111,7 @@ interface State {
   edgeMetrics: Record<string, EdgeMetric>;
   sim: SimResult;
   log: FdrEntry[];
-  lastMutation?: { source: Source; op: string; tick: number };
+  lastMutation?: { source: Source; op: string; tick: number; targetId?: string };
 }
 
 interface DomainResult {
@@ -570,7 +571,7 @@ function mutate(
   const nextState = {
     ...outcome.state,
     version: nextVersion,
-    lastMutation: { source, op, tick: current.tick },
+    lastMutation: { source, op, tick: current.tick, targetId: typeof args.targetId === 'string' ? args.targetId : typeof args.id === 'string' ? args.id : typeof args.zone === 'string' ? args.zone : typeof args.region === 'string' ? args.region : undefined },
     log: appendLog(outcome.state, {
       source,
       op,
@@ -612,6 +613,25 @@ function pinLabel(pin: PinId) {
 
 function toolInputSchema(properties: Record<string, unknown>, required: string[] = []) {
   return { type: 'object', properties, required, additionalProperties: false };
+}
+
+function rootCauseFor(architecture: ArchitectureDefinition, state: State): RootCauseAnalysis {
+  const nodeNames = new Map(architecture.nodes.map((node) => [node.id, node.name]));
+  const edgeNames = new Map(architecture.edges.map((edge) => [edge.id, `${nodeNames.get(edge.from) ?? edge.from} → ${nodeNames.get(edge.to) ?? edge.to}`]));
+  return analyseRootCause({
+    tick: state.tick,
+    storeVersion: state.version,
+    stressActive: state.stressActive,
+    failedZones: state.failedZones,
+    failedRegions: state.failedRegions,
+    killedComponents: state.killedNodes.map((id) => ({ id, name: nodeNames.get(id) ?? id })),
+    faults: Object.entries(state.faults).map(([targetId, fault]) => ({ targetId, targetName: nodeNames.get(targetId) ?? edgeNames.get(targetId) ?? targetId, targetType: edgeNames.has(targetId) ? 'connection' : 'component', ...fault })),
+    overloadedComponents: architecture.nodes.flatMap((node) => {
+      const metric = state.nodeMetrics[node.id];
+      return metric && (metric.utilisation >= 1 || (metric.overflowRps ?? 0) > 0) ? [{ id: node.id, name: node.name, utilisation: metric.utilisation, overflowRps: metric.overflowRps ?? 0 }] : [];
+    }),
+    impact: { availability: state.sim.availability, latencyMs: state.sim.p95Ms, errorRate: state.sim.errorRate, achievedRps: state.sim.rpsAchieved, sloPass: state.sim.sloPass, breachReasons: state.sim.breachReasons },
+  });
 }
 
 function makeTools(
@@ -698,6 +718,15 @@ function makeTools(
           observations,
           storeVersion: state.version,
         });
+      },
+    },
+    {
+      name: 'get_root_cause_analysis',
+      description: 'Explain the current failure using live topology, fault, capacity, SLO, and Flight Data Recorder evidence. This tool is read-only and returns recovery actions supported by the bench.',
+      inputSchema: toolInputSchema({}),
+      execute: () => {
+        const state = getState();
+        return read('get_root_cause_analysis', {}, { analysis: rootCauseFor(architecture, state) });
       },
     },
     {
@@ -811,6 +840,12 @@ function makeTools(
         execute: (input) => invoke('fail_region', { region: String(input.region) }, Number(input.expectedVersion)),
       },
       {
+        name: 'restore_region',
+        description: 'Restore one failed region and its placed services.',
+        inputSchema: toolInputSchema({ region: { type: 'string', enum: ['europe-west2', 'us-east4'] }, expectedVersion: { type: 'number' } }, ['region', 'expectedVersion']),
+        execute: (input) => invoke('restore_region', { region: String(input.region) }, Number(input.expectedVersion)),
+      },
+      {
         name: 'set_region_traffic_split',
         description: 'Set the primary-region traffic allocation.',
         inputSchema: toolInputSchema({ primaryPercent: { type: 'number' }, expectedVersion: { type: 'number' } }, ['primaryPercent', 'expectedVersion']),
@@ -901,6 +936,10 @@ function runCommandFor(
       const region = args.region as Region;
       if (state.pins.includes('no_second_region') && region === 'us-east4') return { state, result: { ok: false, code: 'PINNED_NO_SECOND_REGION', message: 'Secondary region is already excluded by a pinned human constraint.' } };
       return { state: applyMetrics({ ...state, failedRegions: Array.from(new Set([...state.failedRegions, region])), running: true, stressActive: true }, architecture), result: { region } };
+    }
+    if (op === 'restore_region') {
+      const region = args.region as Region;
+      return { state: applyMetrics({ ...state, failedRegions: state.failedRegions.filter((item) => item !== region) }, architecture), result: { region } };
     }
     if (op === 'fail_zone') {
       const zone = args.zone as ZoneId;
@@ -1220,18 +1259,19 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
         entry.lineMaterial.color.setHex(color);
         entry.glowMaterial.color.setHex(color);
         entry.lineMaterial.opacity = signalOpacity(health);
-        entry.glowMaterial.opacity = health === 'down' ? 0.025 : health === 'degraded' ? 0.16 : 0.08;
+        const failurePulse = reducedMotion ? 1 : 0.72 + (Math.sin(elapsed * 6 + entry.index) + 1) * 0.22;
+        entry.glowMaterial.opacity = health === 'down' ? 0.08 * failurePulse : health === 'degraded' ? 0.34 * failurePulse : 0.08;
         entry.packets.forEach((packet, packetIndex) => {
           packet.material.color.setHex(color);
           packet.glowMaterial.color.setHex(color);
           packet.mesh.visible = health !== 'down' && !reducedMotion;
           packet.glow.visible = packet.mesh.visible;
           if (packet.mesh.visible) {
-            const speed = health === 'degraded' ? 0.2 : 0.14;
+            const speed = health === 'degraded' ? 0.32 : 0.14;
             const progress = (elapsed * speed + packetIndex * 0.29 + entry.index * 0.07) % 1;
             packet.mesh.position.copy(entry.curve.getPoint(progress));
             packet.glow.position.copy(packet.mesh.position);
-            packet.glow.scale.setScalar(0.1 + Math.sin(elapsed * 4 + packetIndex) * 0.025);
+            packet.glow.scale.setScalar((health === 'degraded' ? 0.18 : 0.1) + Math.sin(elapsed * (health === 'degraded' ? 8 : 4) + packetIndex) * 0.035);
             packet.mesh.position.z = 0.02;
             packet.glow.position.z = 0.015;
           }
@@ -1241,8 +1281,8 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
       anchors.forEach(({ node, anchor, material }, index) => {
         const health = nextState.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy';
         material.color.setHex(signalColor(health));
-        material.opacity = health === 'down' ? 0.08 : health === 'degraded' ? 0.52 : 0.3;
-        const pulse = reducedMotion ? 1 : 1 + Math.sin(elapsed * 1.6 + index * 0.7) * 0.16;
+        material.opacity = health === 'down' ? 0.48 : health === 'degraded' ? 0.72 : 0.3;
+        const pulse = reducedMotion ? 1 : health === 'healthy' ? 1 + Math.sin(elapsed * 1.6 + index * 0.7) * 0.16 : 1.25 + Math.sin(elapsed * 5.4 + index * 0.7) * 0.38;
         anchor.scale.setScalar(pulse);
       });
     };
@@ -1295,6 +1335,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
   const nodeMap = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture.nodes]);
   const availabilityZones = zonesForArchitecture(architecture);
   const planes = architecturePlanes(architecture);
+  const hasActiveFailure = state.failedZones.length > 0 || state.failedRegions.length > 0 || state.killedNodes.length > 0 || Object.keys(state.faults).length > 0 || (state.stressActive && !state.sim.sloPass);
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1305,7 +1346,8 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
   }, [onSelectNode, selectedNode]);
   return (
     <div className="topology-workbench">
-      <div className={`graph-board ${architecture.id}`}>
+      <div className={`graph-board ${architecture.id} ${hasActiveFailure ? 'failure-active' : ''}`}>
+      {hasActiveFailure && <div className="failure-propagation" aria-hidden="true"><span>FAILURE PROPAGATION</span></div>}
       <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
       <div className="availability-map" aria-label="Availability zone status">{availabilityZones.map((zone) => {
         const placements = architecture.nodes.flatMap((node) => replicaPlacementsFor(state, node)).filter((item) => item === zone).length;
@@ -1319,7 +1361,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
         <defs><marker id={`edge-arrow-${architecture.id}`} markerWidth="8" markerHeight="8" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" /></marker></defs>
         {architecture.edges.map((edge) => {
           const stateClass = edgeState(edge, state);
-          return <path key={edge.id} d={connectionPath(edge, nodeMap)} className={`graph-edge edge-${stateClass} edge-${edge.kind}`} markerEnd={`url(#edge-arrow-${architecture.id})`} />;
+          return <path key={edge.id} d={connectionPath(edge, nodeMap)} className={`graph-edge edge-${stateClass} edge-${edge.kind} ${state.lastMutation?.targetId === edge.id ? `mutation-${state.lastMutation.source}` : ''}`} markerEnd={`url(#edge-arrow-${architecture.id})`} />;
         })}
       </svg>
       {architecture.nodes.map((node) => {
@@ -1327,7 +1369,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
         const health = metric?.effectiveHealth ?? 'healthy';
         const isSelected = node.id === selectedNodeId;
         return (
-          <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.faults[node.id] ? 'fault-active' : ''} ${state.lastMutation?.op.includes(node.id) ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
+          <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.faults[node.id] ? 'fault-active' : ''} ${state.lastMutation?.targetId === node.id ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
             <span className="node-top"><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
             <strong>{node.name}</strong>
             {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
@@ -1336,7 +1378,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
           </button>
         );
       })}
-      <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />saturated flow</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
+      <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />failure propagation</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
       </div>
       {selectedNode && <NodeInspector architecture={architecture} node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} invoke={invoke} onClose={() => onSelectNode('')} />}
     </div>
@@ -1386,6 +1428,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
   const pins: PinId[] = architecture.id === 'event_driven_checkout' ? ['keep_pubsub_ordering', 'budget_hard'] : architecture.id === 'multi_region_saas' ? ['no_second_region', 'budget_hard'] : ['keep_old_model', 'budget_hard'];
   const availabilityZones = zonesForArchitecture(architecture);
   const activeFaults = Object.entries(state.faults);
+  const rca = rootCauseFor(architecture, state);
   return (
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
@@ -1399,6 +1442,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
       <section className="rail-section rail-faults"><div className="section-title"><span>Fault injection</span><span className={activeFaults.length ? 'readout-status bad' : 'pin-count'}>{activeFaults.length} active</span></div><p>WebMCP can target any component or connection with latency and request dropout. Effects are traffic-weighted and recorded in the FDR.</p>{activeFaults.length ? <div className="fault-list">{activeFaults.map(([targetId, fault]) => <div key={targetId}><code>{targetId}</code><span>+{formatNumber(fault.latencyMs)} ms · {formatNumber(fault.dropoutPercent, 2)}% drop</span></div>)}<button onClick={() => invoke('clear_all_faults', {})}>Clear all injected faults</button></div> : <div className="fault-empty"><span>NO ACTIVE FAULTS</span><small>Tools: set_fault_profile · clear_fault_profile</small></div>}</section>
       <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><p>Constraints are domain invariants. The graph stays visible when a region or model is excluded.</p><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
       <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
+      <section className={`rail-section rail-rca rca-${rca.status}`}><div className="section-title"><span>Root cause analysis</span><span className={`readout-status ${rca.status === 'healthy' ? 'good' : 'bad'}`}>{rca.status}</span></div><p>{rca.summary}</p>{rca.primaryCause && <div className="rca-primary"><span>PRIMARY / {Math.round(rca.primaryCause.confidence * 100)}% CONFIDENCE</span><code>{rca.primaryCause.targetId}</code><small>Ask WebMCP: get_root_cause_analysis</small></div>}</section>
       <section className="rail-section rail-reference"><div className="section-title"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a></div><p>{architecture.referenceSpec}</p></section>
       <section className="rail-section rail-tools"><div className="section-title"><span>Tool surface</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div><p>{toolStatus === 'green' ? `${toolCount} architecture-specific tools registered.` : toolStatus === 'amber' ? 'Browser tools unavailable. The bench remains fully runnable.' : toolStatus === 'red' ? 'Registration needs attention.' : 'Registering on Bench.'}</p><div className="tool-note"><span className="tool-rail-mark" />same store / same version / same truth</div></section>
       <section className="rail-section provenance"><span>Model boundary</span><p>Simulation values are inspectable model assumptions. Pricing is a public list-price estimate, not a bill.</p><small>Snapshot / 2026-08-27</small></section>
