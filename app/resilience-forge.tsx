@@ -23,6 +23,7 @@ import {
   type Region,
 } from './data';
 import { registerWebMcpTools, type ToolRegistration } from './webmcp';
+import { evaluateSlo, releaseEndpointReasons } from './slo';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -35,6 +36,13 @@ interface NodeMetric {
   overflowRps?: number;
   ttftMs?: number;
   effectiveHealth: Health;
+  capacityModel?: {
+    concurrency: number;
+    serviceTimeMs: number;
+    schedulingEfficiency: number;
+    batchGain: number;
+    reserveRps: number;
+  };
 }
 
 interface EdgeMetric {
@@ -155,7 +163,7 @@ function createInitialState(architecture: ArchitectureDefinition): State {
     orderingKeyShards: 1,
     pubsubBatch: 1,
     regionPrimaryPercent: 50,
-    modelNewPercent: 20,
+    modelNewPercent: architecture.id === 'llm_inference_serving' ? 100 : 20,
     failedRegions: [],
     failedZones: [],
     killedNodes: [],
@@ -198,6 +206,14 @@ function nodeHealth(state: State, node: NodeDefinition): Health {
   if (state.failedRegions.includes(node.region)) return 'down';
   if (node.zone && state.failedZones.includes(node.zone)) return 'down';
   return 'healthy';
+}
+
+function inferenceCapacity(node: NodeDefinition, replicas: number, batch: number) {
+  const profile = node.capacityModel;
+  const batchGain = 1 + Math.min(batch - 1, 9) * 0.08;
+  if (!profile) return { capacity: replicas * node.capacityPerReplica * batchGain, batchGain };
+  const perReplica = profile.concurrency * (1000 / profile.serviceTimeMs) * profile.schedulingEfficiency;
+  return { capacity: replicas * perReplica * batchGain, batchGain };
 }
 
 function addEdgeMetrics(
@@ -285,19 +301,19 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       const share = isNew ? state.modelNewPercent / 100 : 1 - state.modelNewPercent / 100;
       demand = state.peakRps * share;
       const batch = state.batching[node.id]?.maxBatch ?? 1;
-      capacity = replicas * node.capacityPerReplica * (1 + Math.min(batch - 1, 9) * 0.08);
+      const inference = inferenceCapacity(node, replicas, batch);
+      capacity = inference.capacity;
       if (state.stressActive) {
         served = Math.min(demand, capacity);
         overflowRps = Math.max(0, demand - served);
         const utilisation = demand / Math.max(capacity, 1);
         ttftMs = utilisation < 0.7 ? 350 : utilisation <= 0.9 ? 700 : utilisation <= 1 ? 1500 : 3000;
         if (state.batching[node.id]) ttftMs += state.batching[node.id].waitMs;
-        if (isNew && overflowRps > 0) breachReasons.push('VERTEX AI OVERFLOW');
+        if (isNew) breachReasons.push(...releaseEndpointReasons(utilisation, overflowRps));
         p95Ms = Math.max(p95Ms, ttftMs);
       } else {
         ttftMs = 350;
       }
-      if (isNew && state.modelNewPercent > 55 && state.stressActive) breachReasons.push('RELEASE ENDPOINT SATURATED');
     }
 
     if (health === 'down') served = 0;
@@ -316,6 +332,13 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       overflowRps: overflowRps || undefined,
       ttftMs,
       effectiveHealth,
+      capacityModel: node.capacityModel ? {
+        concurrency: node.capacityModel.concurrency,
+        serviceTimeMs: node.capacityModel.serviceTimeMs,
+        schedulingEfficiency: node.capacityModel.schedulingEfficiency,
+        batchGain: architecture.id === 'llm_inference_serving' ? inferenceCapacity(node, replicas, state.batching[node.id]?.maxBatch ?? 1).batchGain : 1,
+        reserveRps: capacity * node.capacityModel.reservePercent / 100,
+      } : undefined,
     };
   }
 
@@ -359,13 +382,17 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   if (state.stressActive && cost > state.budget) breachReasons.push('BUDGET LIMIT');
   if (!state.stressActive) breachReasons.push('SLO NOT TESTED');
 
-  const sloPass =
-    state.stressActive &&
-    availability >= state.availabilityTarget &&
-    p95Ms <= state.latencyTarget &&
-    errorRate <= 1 - state.availabilityTarget &&
-    cost <= state.budget &&
-    breachReasons.length === 0;
+  const sloPass = evaluateSlo({
+    stressActive: state.stressActive,
+    availability,
+    availabilityTarget: state.availabilityTarget,
+    latencyMs: p95Ms,
+    latencyTargetMs: state.latencyTarget,
+    errorRate,
+    cost,
+    budget: state.budget,
+    breachReasons,
+  });
 
   const edgeMetrics = addEdgeMetrics(state, architecture, nodeMetrics);
   return {
@@ -1105,8 +1132,17 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
 function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: { architecture: ArchitectureDefinition; state: State; selectedNodeId: string | null; onSelectNode: (id: string) => void }) {
   const selectedNode = architecture.nodes.find((node) => node.id === selectedNodeId);
   const nodeMap = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture.nodes]);
+  useEffect(() => {
+    if (!selectedNode) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onSelectNode('');
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onSelectNode, selectedNode]);
   return (
-    <div className={`graph-board ${architecture.id}`}>
+    <div className="topology-workbench">
+      <div className={`graph-board ${architecture.id}`}>
       <div className="graph-board-meta"><span>LIVE PROJECTION / {architecture.eyebrow}</span><span className="graph-meta-right"><i className="pulse-ring" />{state.running ? 'SIM RUNNING' : 'BENCH READY'} / TICK {String(state.tick).padStart(3, '0')}</span></div>
       {architecture.id === 'multi_region_saas' && <><div className={`region-zone region-a ${state.failedRegions.includes('europe-west2') ? 'failed' : ''}`}><span>EUROPE-WEST2 / PRIMARY</span></div><div className={`region-zone region-b ${state.failedRegions.includes('us-east4') || state.pins.includes('no_second_region') ? 'failed' : ''}`}><span>US-EAST4 / SECONDARY</span></div></>}
       <TopologySignalField architecture={architecture} state={state} />
@@ -1122,28 +1158,30 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode }: {
         const health = metric?.effectiveHealth ?? 'healthy';
         const isSelected = node.id === selectedNodeId;
         return (
-          <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.lastMutation?.op.includes(node.id) ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(node.id)} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
+          <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.lastMutation?.op.includes(node.id) ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
             <span className="node-top"><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
             <strong>{node.name}</strong>
             <span className="node-stats"><span>{metric ? `${formatNumber(metric.utilisation * 100, 0)}%` : '--'} util</span><span>{healthLabel(health)}</span></span>
           </button>
         );
       })}
-      {selectedNode && <NodeInspector node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} onClose={() => onSelectNode('')} />}
       <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />saturated flow</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
+      </div>
+      {selectedNode && <NodeInspector node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} onClose={() => onSelectNode('')} />}
     </div>
   );
 }
 
 function NodeInspector({ node, metric, state, onClose }: { node: NodeDefinition; metric?: NodeMetric; state: State; onClose: () => void }) {
   return (
-    <div className="node-inspector" role="dialog" aria-label={`${node.name} inspector`}>
+    <aside className="node-inspector" aria-label={`${node.name} inspector`}>
       <div className="inspector-head"><div><span className="eyebrow">NODE INSPECTOR</span><h3>{node.name}</h3></div><button className="icon-button" onClick={onClose} aria-label="Close inspector"><span className="close-mark" aria-hidden="true" /></button></div>
       <dl><div><dt>Kind</dt><dd>{node.kind}</dd></div><div><dt>Region / zone</dt><dd>{node.region}{node.zone ? ` / ${node.zone}` : ''}</dd></div><div><dt>Replicas</dt><dd>{state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
       {metric?.queueDepth !== undefined && <p className="inspector-note">Queue depth <b>{formatNumber(metric.queueDepth)}</b> · overflow <b>{formatNumber(metric.overflowRps ?? 0)} req/s</b></p>}
       {metric?.ttftMs !== undefined && <p className="inspector-note">TTFT <b>{formatNumber(metric.ttftMs)} ms</b> · model assumption</p>}
+      {metric?.capacityModel && <div className="capacity-equation" aria-label="Capacity model"><span>Capacity model</span><code>{state.replicaOverrides[node.id] ?? node.replicas} replicas × {metric.capacityModel.concurrency} concurrent × 1,000/{metric.capacityModel.serviceTimeMs} ms × {formatNumber(metric.capacityModel.schedulingEfficiency * 100)}% scheduler × {formatNumber(metric.capacityModel.batchGain, 2)} batch</code><small>{formatNumber(metric.capacityModel.reserveRps)} req/s operational reserve shown separately from available headroom.</small></div>}
       <p className="inspector-source">limits / model assumption / 2026-08-27</p>
-    </div>
+    </aside>
   );
 }
 
@@ -1175,7 +1213,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
       <section className="rail-section rail-live"><div className="section-title"><span>Live controls</span><span className="human-chip">HUMAN / OPEN</span></div><p>These controls stay usable while SITE TOOLS is operating.</p><button className={`stress-button ${state.running ? 'running' : ''}`} onClick={() => state.running ? invoke('stop_stress_test', {}) : invoke('run_stress_test', { trafficMultiplier: 1 })}>{state.running ? 'Stop stress test' : stressLabel}<span className="button-mark" aria-hidden="true" /></button>
-        <RangeControl label="Peak load" value={state.peakRps} min={architecture.id === 'llm_inference_serving' ? 60 : 1000} max={architecture.id === 'event_driven_checkout' ? 18000 : architecture.id === 'multi_region_saas' ? 9000 : 500} step={architecture.id === 'event_driven_checkout' ? 500 : 50} suffix=" req/s" onChange={(value) => invoke('set_peak_rps', { peakRps: value })} />
+        <RangeControl label="Peak load" value={state.peakRps} min={architecture.id === 'llm_inference_serving' ? 60 : 1000} max={architecture.id === 'event_driven_checkout' ? 18000 : architecture.id === 'multi_region_saas' ? 9000 : 500} step={architecture.id === 'event_driven_checkout' ? 500 : architecture.id === 'llm_inference_serving' ? 10 : 50} suffix=" req/s" onChange={(value) => invoke('set_peak_rps', { peakRps: value })} />
         <RangeControl label="Monthly budget" value={state.budget} min={3000} max={22000} step={100} suffix=" GBP" onChange={(value) => invoke('set_budget', { budget: value })} />
         {architecture.id === 'multi_region_saas' && <RangeControl label="Primary traffic allocation" value={state.regionPrimaryPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_region_traffic_split', { primaryPercent: value })} />}
         {architecture.id === 'llm_inference_serving' && <RangeControl label="New model traffic" value={state.modelNewPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_model_traffic_split', { newModelPercent: value })} />}

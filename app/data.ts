@@ -29,6 +29,12 @@ export interface NodeDefinition {
   zone?: 'a' | 'b';
   replicas: number;
   capacityPerReplica: number;
+  capacityModel?: {
+    concurrency: number;
+    serviceTimeMs: number;
+    schedulingEfficiency: number;
+    reservePercent: number;
+  };
   legalRemediations: string[];
   x: number;
   y: number;
@@ -159,8 +165,8 @@ export const architectures: ArchitectureDefinition[] = [
       { id: 'clients', kind: 'client', name: 'Clients', shortName: 'CLIENTS', region: 'europe-west2', replicas: 1, capacityPerReplica: 1000, legalRemediations: [], x: 13, y: 45, accent: 'cyan' },
       { id: 'api_gateway', kind: 'gateway', name: 'API Gateway', shortName: 'API', region: 'europe-west2', replicas: 2, capacityPerReplica: 220, legalRemediations: ['set_autoscaling'], x: 29, y: 45, accent: 'cyan' },
       { id: 'cloud_run_router', kind: 'service', name: 'Cloud Run / Model router', shortName: 'RUN / ROUTER', region: 'europe-west2', replicas: 2, capacityPerReplica: 220, legalRemediations: ['set_autoscaling'], x: 45, y: 45, accent: 'orange' },
-      { id: 'vertex_stable', kind: 'gpu', name: 'Vertex AI endpoint / stable', shortName: 'VERTEX / STABLE', region: 'europe-west2', replicas: 2, capacityPerReplica: 120, legalRemediations: ['set_autoscaling', 'set_batching'], x: 64, y: 28, accent: 'cyan' },
-      { id: 'vertex_rc', kind: 'gpu', name: 'Vertex AI endpoint / release candidate', shortName: 'VERTEX / RC', region: 'europe-west2', replicas: 1, capacityPerReplica: 80, legalRemediations: ['set_autoscaling', 'set_batching', 'set_model_traffic_split'], x: 64, y: 63, accent: 'acid' },
+      { id: 'vertex_stable', kind: 'gpu', name: 'Vertex AI endpoint / stable', shortName: 'VERTEX / STABLE', region: 'europe-west2', replicas: 2, capacityPerReplica: 120, capacityModel: { concurrency: 6, serviceTimeMs: 45, schedulingEfficiency: 0.9, reservePercent: 10 }, legalRemediations: ['set_autoscaling', 'set_batching'], x: 64, y: 28, accent: 'cyan' },
+      { id: 'vertex_rc', kind: 'gpu', name: 'Vertex AI endpoint / release candidate', shortName: 'VERTEX / RC', region: 'europe-west2', replicas: 3, capacityPerReplica: 80, capacityModel: { concurrency: 4, serviceTimeMs: 45, schedulingEfficiency: 0.9, reservePercent: 10 }, legalRemediations: ['set_autoscaling', 'set_batching', 'set_model_traffic_split'], x: 64, y: 63, accent: 'acid' },
       { id: 'memorystore', kind: 'cache', name: 'Memorystore for Redis / KV cache', shortName: 'MEMORYSTORE', region: 'europe-west2', replicas: 2, capacityPerReplica: 350, legalRemediations: ['set_autoscaling'], x: 84, y: 28, accent: 'violet' },
       { id: 'pubsub_overflow', kind: 'queue', name: 'Pub/Sub overflow subscription', shortName: 'PUB/SUB', region: 'europe-west2', replicas: 1, capacityPerReplica: 1000, legalRemediations: ['set_batching'], x: 84, y: 63, accent: 'orange' },
     ],
