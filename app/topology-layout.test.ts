@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { architectures } from './data.ts';
 import {
+  MIN_CARD_GAP_PCT,
   NODE_HEIGHT_PCT,
   NODE_WIDTH_PCT,
   STAGE_MIN_WIDTH,
+  boxContainsCard,
   connectionGeometry,
   connectionPath,
+  frameForNode,
   topologyGrids,
 } from './topology-layout.ts';
 
@@ -46,9 +49,26 @@ test('every node sits on its architecture grid without overlapping', () => {
       for (let j = i + 1; j < architecture.nodes.length; j += 1) {
         const a = architecture.nodes[i];
         const b = architecture.nodes[j];
-        const overlap = Math.abs(a.x - b.x) < NODE_WIDTH_PCT && Math.abs(a.y - b.y) < NODE_HEIGHT_PCT;
+        const gapX = Math.abs(a.x - b.x) - NODE_WIDTH_PCT;
+        const gapY = Math.abs(a.y - b.y) - NODE_HEIGHT_PCT;
+        const overlap = gapX < 0 && gapY < 0;
         assert.equal(overlap, false, `${architecture.id} ${a.id} overlaps ${b.id}`);
+        if (a.x !== b.x && a.y === b.y) {
+          assert.ok(gapX >= MIN_CARD_GAP_PCT - 0.05, `${architecture.id} ${a.id}/${b.id} horizontal gap ${gapX}`);
+        }
+        if (a.y !== b.y && a.x === b.x) {
+          assert.ok(gapY >= MIN_CARD_GAP_PCT - 0.05, `${architecture.id} ${a.id}/${b.id} vertical gap ${gapY}`);
+        }
       }
+    }
+  }
+});
+
+test('cards sit inside the frames they belong to', () => {
+  for (const architecture of architectures) {
+    for (const node of architecture.nodes) {
+      const box = frameForNode(architecture.id, node);
+      assert.equal(boxContainsCard(box, node), true, `${architecture.id} ${node.id} escapes its frame`);
     }
   }
 });
@@ -56,7 +76,7 @@ test('every node sits on its architecture grid without overlapping', () => {
 test('core columns share one pitch', () => {
   for (const [id, grid] of Object.entries(topologyGrids)) {
     const gaps = grid.columns.slice(1).map((x, index) => x - grid.columns[index]);
-    const core = id === 'multi_region_saas' ? gaps.slice(1, -1) : gaps;
+    const core = id === 'multi_region_saas' ? gaps.slice(1) : gaps;
     assert.ok(core.length > 0);
     for (const gap of core) assert.equal(gap, core[0], `${id} uneven pitch ${gaps.join(',')}`);
   }

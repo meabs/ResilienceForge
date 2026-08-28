@@ -30,7 +30,7 @@ import { evaluateSlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
 import { gcpIconFor } from './gcp-icons';
-import { connectionGeometry, connectionPath, type GraphPoint } from './topology-layout';
+import { connectionGeometry, connectionPath, percentBoxStyle, type GraphPoint } from './topology-layout';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -1438,34 +1438,32 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
       <div className="graph-stage">
       {hasActiveFailure && <div className="failure-propagation" aria-hidden="true"><span>FAILURE PROPAGATION</span></div>}
       <div className={`gcp-topology-frame gcp-topology-${topologyFrame.layout}`} aria-label="GCP deployment topology">
-        {topologyFrame.layout === 'pair' && (
-          <div className="gcp-global-strip">
+        {topologyFrame.layout === 'pair' && topologyFrame.globalBox && (
+          <div className="gcp-global-strip" style={percentBoxStyle(topologyFrame.globalBox)}>
             <span className="gcp-frame-label">{topologyFrame.globalLabel}</span>
             <small>{topologyFrame.globalSublabel}</small>
           </div>
         )}
-        <div className="gcp-region-stack">
-          {topologyFrame.regions.map((region) => (
-            <div className={`${region.className} ${region.failed ? 'failed' : ''}`} key={region.key}>
-              <div className="gcp-region-header">
-                <div>
-                  <span>{region.label}</span>
-                  <small>{region.sublabel}</small>
-                </div>
-                <div className="gcp-zone-chips">
-                  {region.zones.map((zone) => (
-                    <i className={`${zone.className} ${zone.failed ? 'failed' : ''}`} key={zone.key} title={zone.sublabel}>{zone.label}</i>
-                  ))}
-                </div>
+        {topologyFrame.regions.map((region) => (
+          <div className={`${region.className} ${region.failed ? 'failed' : ''}`} key={region.key} style={percentBoxStyle(region.box)}>
+            <div className="gcp-region-header">
+              <div>
+                <span>{region.label}</span>
+                <small>{region.sublabel}</small>
+              </div>
+              <div className="gcp-zone-chips">
+                {region.zones.map((zone) => (
+                  <i className={`${zone.className} ${zone.failed ? 'failed' : ''}`} key={zone.key} title={zone.sublabel}>{zone.label}</i>
+                ))}
               </div>
             </div>
-          ))}
-        </div>
+          </div>
+        ))}
       </div>
       {topologyFrame.layout === 'regional' && (
         <div className="topology-lanes" aria-hidden="true">
           {topologyFrame.lanes.map((lane) => (
-            <div className="topology-lane" key={lane.key} style={{ left: `${lane.start}%`, width: `${lane.end - lane.start}%` }}>
+            <div className="topology-lane" key={lane.key} style={{ left: `${lane.start}%`, width: `${lane.end - lane.start}%`, top: `${lane.top}%`, height: `${lane.height}%` }}>
               <span>{lane.label}</span>
             </div>
           ))}
