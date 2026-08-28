@@ -3,6 +3,8 @@ import test from 'node:test';
 import { applyPlanSteps, parseRemediationSteps } from './bench-ops.ts';
 import { pinRejection } from './pins.ts';
 
+type PlanResult = { ok: boolean; code?: string; message?: string };
+
 test('plan parser rejects empty, oversized, nested, and malformed steps', () => {
   assert.equal(parseRemediationSteps([]).ok, false);
   assert.equal(parseRemediationSteps(undefined).ok, false);
@@ -24,7 +26,7 @@ test('plan parser accepts a compound remediation', () => {
 
 test('applyPlanSteps is all-or-nothing', () => {
   const applied: string[] = [];
-  const failed = applyPlanSteps(0, [{ op: 'ok', args: {} }, { op: 'fail', args: {} }], (state, op) => {
+  const failed = applyPlanSteps<number, PlanResult>(0, [{ op: 'ok', args: {} }, { op: 'fail', args: {} }], (state, op) => {
     applied.push(op);
     if (op === 'fail') return { state, result: { ok: false as const, code: 'PINNED_BUDGET', message: 'budget' } };
     return { state: state + 1, result: { ok: true as const } };
@@ -52,7 +54,7 @@ test('apply_remediation_plan cannot bypass a pinned traffic split', () => {
   assert.equal(parsed.ok, true);
   if (!parsed.ok) return;
   const pins = ['no_second_region'] as const;
-  const result = applyPlanSteps({}, parsed.steps, (state, op, args) => {
+  const result = applyPlanSteps<Record<string, unknown>, PlanResult>({}, parsed.steps, (state, op, args) => {
     const pinned = pinRejection([...pins], op, args);
     if (pinned) return { state, result: pinned };
     return { state, result: { ok: true as const } };

@@ -1946,12 +1946,12 @@ function useSiteTools() {
       ensureWebMcpRegistration(SITE_SESSION, tools)
         .then((result) => {
           if (cancelled) return;
-          if (result.supported) {
+          if (result.supported && result.ready) {
             setToolStatus('green');
             setToolCount(result.count);
           } else {
             setToolStatus('amber');
-            setToolCount(0);
+            setToolCount(result.count);
           }
         })
         .catch(() => {
@@ -2472,16 +2472,6 @@ function FdrTicker({ entries }: { entries: FdrEntry[] }) {
       </div>
     </footer>
   );
-}
-
-declare global {
-  interface Window {
-    resilienceForge?: {
-      invoke: (op: string, args: Record<string, unknown>, expectedVersion?: number) => DomainResult;
-      getState: () => State;
-      webmcp?: ReturnType<typeof getWebMcpStatus>;
-    };
-  }
 }
 
 function UnknownBench({ requestedId, toolStatus, toolCount }: { requestedId: string; toolStatus: ToolLamp; toolCount: number }) {

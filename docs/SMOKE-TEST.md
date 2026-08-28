@@ -2,7 +2,7 @@
 
 Target: [resilience-forge.gman72.chatgpt.site](https://resilience-forge.gman72.chatgpt.site/)
 
-Environment: standard browser (no WebMCP runtime) plus a local mocked `document.modelContext` for SITE TOOLS green / tool-path checks. ChatGPT desktop in-app browser is required for a true host `toolsReady`.
+Environment: standard browser (no WebMCP runtime) plus a local mocked `document.modelContext` for SITE TOOLS green / tool-path checks. A ChatGPT desktop in-app-browser render of the current public site was also inspected; it is the required environment for a true host `toolsReady` and actual agent tool calls.
 
 ## Results
 
@@ -11,7 +11,7 @@ Environment: standard browser (no WebMCP runtime) plus a local mocked `document.
 | Catalogue loads | PASS — three equal reference cards |
 | `list_architectures` | PASS — checkout, saas, llm |
 | `load_architecture` checkout/saas/llm | PASS — same-document navigation, `toolsUnchanged: true` |
-| `get_webmcp_status.toolsReady` | PASS under mocked WebMCP (`true`). Standard Chrome stays **AMBER**. Production without this commit still shows the previous lamp until deploy. |
+| `get_webmcp_status.toolsReady` | PASS under mocked WebMCP (`true`). Standard Chrome stays **AMBER**. Recheck the final public version in the judge-compatible browser after deployment. |
 | `get_bench_snapshot` | PASS — `storeVersion`, `metrics.sim`, `constraints`, `topology.nodes` |
 | `get_decision_log` | PASS — `ui:load_architecture` and `webmcp` entries including `STALE_STATE` |
 | Deliberate stale mutation | PASS — `STALE_STATE` |
@@ -26,9 +26,11 @@ Environment: standard browser (no WebMCP runtime) plus a local mocked `document.
 | FDR after tool calls | PASS — immediate `webmcp` rows |
 | Canvas / gauges on mutations | PASS — queue depth, regional failure, model split |
 | Reduced motion | PASS — SLO/queue still update with motion reduced |
-| Live site without WebMCP | PASS — logged-out HTTPS 200, SITE TOOLS unavailable (amber after this deploy) |
+| Live site without WebMCP | PASS — logged-out HTTPS 200; without a WebMCP runtime, SITE TOOLS is intentionally amber. |
 | Public GitHub logged-out | PASS — `https://github.com/meabs/ResilienceForge` HTTP 200, `logged_in=no` |
-| `npm test` | PASS — 63 tests |
+| `npm test` | PASS — 64 tests |
+| Live ChatGPT in-app-browser render | PASS — HTTPS page rendered with SITE TOOLS LIVE, 37/37 tools, and no console errors on the pre-deploy public version. |
+| Automated host WebMCP calls | NOT RUN — the current browser automation model did not expose its `webmcp_list_tools` command; perform the judge path manually. |
 
 ## Judge path (manual, WebMCP browser)
 

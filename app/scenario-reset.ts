@@ -62,6 +62,7 @@ export function benchShowsFailure(state: {
   failedRegions: string[];
   killedNodes: string[];
   faults: Record<string, unknown>;
+  running?: boolean;
   stressActive: boolean;
   sloPass: boolean;
 }) {

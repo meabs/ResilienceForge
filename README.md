@@ -5,6 +5,7 @@ Resilience Forge is a shared human-and-browser-agent operations bench for testin
 - **Live project:** [resilience-forge.gman72.chatgpt.site](https://resilience-forge.gman72.chatgpt.site/)
 - **Public source:** [github.com/meabs/ResilienceForge](https://github.com/meabs/ResilienceForge)
 - **License:** [MIT](./LICENSE)
+- **Submission draft:** [devpost-submission.md](./devpost-submission.md)
 - **Submission copy:** [docs/DEVPOST.md](./docs/DEVPOST.md)
 - **Demo video script:** [docs/DEMO-VIDEO.md](./docs/DEMO-VIDEO.md)
 
@@ -79,6 +80,12 @@ npm start
 ```
 
 The production build is emitted by Vinext for the Cloudflare Workers-compatible ChatGPT Sites runtime. The repository includes all application source, tests, styles, assets, lockfile, and hosting configuration required to reproduce the project. No secrets or external infrastructure accounts are required.
+
+## Competition submission notes
+
+This repository was first committed on 27 August 2026, after the WebMCP Challenge build period opened. The WebMCP implementation and the dated hardening work are visible in the public history, including `4cb7cec`, `b0de315`, `c0fcbf9`, and `31bf380`. If the app existed outside this repository before the build period, use the Existing-project explanation in [devpost-submission.md](./devpost-submission.md) instead of selecting New.
+
+The submission draft is intentionally separate from the form: replace its TODO fields with your own eligibility details, tested clients, AI tools, learning level, career-value answer, and public YouTube URL. Do not submit until the live URL, public repository, video, and ChatGPT in-app-browser WebMCP path have each been rechecked after the final deploy.
 
 ## WebMCP implementation
 

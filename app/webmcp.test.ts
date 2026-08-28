@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { waitUntilCatalogMatches } from './webmcp.ts';
+import { registrationReady, waitUntilCatalogMatches } from './webmcp.ts';
+
+test('registration is not ready until a discoverable catalog matches', () => {
+  assert.equal(registrationReady(true, false), false);
+  assert.equal(registrationReady(true, true), true);
+  assert.equal(registrationReady(false, false), true);
+});
 
 test('catalog wait resolves only after every expected tool name is listed', async () => {
   let listed: Array<{ name: string }> = [];
@@ -24,7 +30,7 @@ test('catalog wait resolves only after every expected tool name is listed', asyn
 
 test('catalog wait can finish from a toolchange-style subscription without waiting for timeout', async () => {
   let listed: Array<{ name: string }> = [];
-  let notify = () => undefined;
+  let notify: () => void = () => undefined;
   const pending = waitUntilCatalogMatches(
     ['alpha', 'beta'],
     async () => listed,

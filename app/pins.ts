@@ -1,6 +1,7 @@
 import type { PinId } from './data.ts';
 
 export interface PinRejection {
+  [key: string]: unknown;
   ok: false;
   code: string;
   message: string;

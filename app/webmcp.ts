@@ -32,7 +32,11 @@ declare global {
     modelContext?: ModelContext;
   }
   interface Window {
-    resilienceForge?: Record<string, unknown>;
+    resilienceForge?: {
+      invoke?: (op: string, args: Record<string, unknown>, expectedVersion?: number) => unknown;
+      getState?: () => unknown;
+      webmcp?: WebMcpStatus;
+    };
   }
 }
 
@@ -62,7 +66,7 @@ export const liveBench: LiveHandlers = {
 
 const session: WebMcpStatus & {
   controller: AbortController | null;
-  pending: Promise<{ supported: boolean; count: number; reused: boolean }> | null;
+  pending: Promise<{ supported: boolean; count: number; reused: boolean; ready: boolean }> | null;
 } = {
   capability: 'unsupported',
   ready: false,
@@ -228,6 +232,10 @@ export async function waitUntilCatalogMatches(
   });
 }
 
+export function registrationReady(hasDiscovery: boolean, catalogMatched: boolean) {
+  return !hasDiscovery || catalogMatched;
+}
+
 function subscribeToolChange(onChange: () => void) {
   const runtime = document.modelContext;
   if (!runtime?.addEventListener) return () => undefined;
@@ -257,7 +265,7 @@ async function publishTools(tools: ToolRegistration[], signal: AbortSignal) {
 }
 
 async function registerAtomically(tools: ToolRegistration[], signal: AbortSignal) {
-  if (!document.modelContext) return { supported: false as const, count: 0 };
+  if (!document.modelContext) return { supported: false as const, count: 0, ready: false as const };
   const names = tools.map((tool) => tool.name);
   session.ready = false;
   session.toolsReady = false;
@@ -267,18 +275,20 @@ async function registerAtomically(tools: ToolRegistration[], signal: AbortSignal
   session.toolNames = names;
   publishCapability();
   await publishTools(tools, signal);
-  if (signal.aborted) return { supported: true as const, count: 0, aborted: true as const };
+  if (signal.aborted) return { supported: true as const, count: 0, ready: false as const, aborted: true as const };
   session.registeredToolCount = tools.length;
   const runtime = document.modelContext;
-  const catalog = runtime?.getTools
+  const hasDiscovery = typeof runtime?.getTools === 'function';
+  const catalog = hasDiscovery
     ? await waitUntilCatalogMatches(names, () => runtime.getTools!(), { signal, subscribe: subscribeToolChange })
     : { matched: true, names };
-  if (signal.aborted) return { supported: true as const, count: 0, aborted: true as const };
+  if (signal.aborted) return { supported: true as const, count: 0, ready: false as const, aborted: true as const };
   session.discoveredToolCount = catalog.matched ? tools.length : catalog.names.length;
-  session.ready = true;
-  session.toolsReady = true;
+  const ready = registrationReady(hasDiscovery, catalog.matched);
+  session.ready = ready;
+  session.toolsReady = ready;
   publishCapability();
-  return { supported: true as const, count: tools.length, aborted: false as const, discovered: catalog.matched };
+  return { supported: true as const, count: session.discoveredToolCount, ready, aborted: false as const, discovered: catalog.matched };
 }
 
 export async function ensureWebMcpRegistration(
@@ -295,11 +305,11 @@ export async function ensureWebMcpRegistration(
     session.registeredToolCount = 0;
     session.discoveredToolCount = 0;
     publishCapability();
-    return { supported: false, count: 0, reused: false };
+    return { supported: false, count: 0, reused: false, ready: false };
   }
   if (session.architectureId === architectureId && session.ready && session.controller && !session.controller.signal.aborted) {
     publishCapability();
-    return { supported: true, count: session.registeredToolCount, reused: true };
+    return { supported: true, count: session.registeredToolCount, reused: true, ready: true };
   }
   if (session.architectureId === architectureId && session.pending && session.controller && !session.controller.signal.aborted) {
     publishCapability();
@@ -312,10 +322,10 @@ export async function ensureWebMcpRegistration(
   session.sessionId = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID().slice(0, 8) : `${Date.now()}`;
   session.pending = registerAtomically(tools, controller.signal).then((result) => {
     if (session.controller === controller) session.pending = null;
-    return { supported: result.supported, count: result.count ?? 0, reused: false };
+    return { supported: result.supported, count: result.count ?? 0, reused: false, ready: result.ready };
   }).catch(() => {
     if (session.controller === controller) session.pending = null;
-    return { supported: false, count: 0, reused: false };
+    return { supported: false, count: 0, reused: false, ready: false };
   });
   return session.pending;
 }
