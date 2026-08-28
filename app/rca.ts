@@ -61,7 +61,7 @@ function recoveryFor(cause: { type: string; targetId: string; tool: string; argu
     zone_failure: {
       expectedEffect: 'Return the failed availability zone and its placed replicas to service.',
       prerequisites: ['Re-read live replica placement.', 'Use the current storeVersion.'],
-      tradeOffs: ['Restoring a zone does not change traffic split or autoscaling bounds.'],
+      tradeOffs: ['Restoring a zone does not change traffic split or autoscaling bounds.', 'Autoscaled services already place replacement replicas in surviving zones.'],
       kind: 'temporary_recovery',
     },
     component_failure: {

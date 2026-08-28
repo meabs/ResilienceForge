@@ -25,3 +25,20 @@ test('fail_component topology health stays failed even with dropout', () => {
     stressActive: true,
   }), 'failed');
 });
+
+test('replacing lost replicas recovers node health during an active stress run', () => {
+  assert.equal(classifyEffectiveHealth({
+    topologyHealth: 'degraded',
+    dropoutPercent: 0,
+    latencyMs: 0,
+    utilisation: 0.9,
+    stressActive: true,
+  }), 'degraded');
+  assert.equal(classifyEffectiveHealth({
+    topologyHealth: 'healthy',
+    dropoutPercent: 0,
+    latencyMs: 0,
+    utilisation: 0.15,
+    stressActive: true,
+  }), 'healthy');
+});

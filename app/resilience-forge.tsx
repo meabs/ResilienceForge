@@ -24,7 +24,7 @@ import {
   type Region,
   type ZoneId,
 } from './data';
-import { availableReplicaCount, replicaHealth } from './availability';
+import { availableReplicaCount, replicaHealth, replicaPlacements } from './availability';
 import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './faults';
 import { bindLiveBench, detectCapability, ensureWebMcpRegistration, getWebMcpStatus, liveBench, releaseWebMcpRegistration, watchModelContext, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
@@ -42,6 +42,7 @@ import {
 import { classifyEffectiveHealth, healthLabel, isOutage } from './health-state';
 import { explainFaultContributions, measurementSemantics } from './measurement';
 import { applyPlanSteps, parseRemediationSteps } from './bench-ops';
+import { benchShowsFailure, withScenarioReset, withStressStopped } from './scenario-reset';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -280,11 +281,13 @@ function gcpResourceProfile(architecture: ArchitectureDefinition, node: NodeDefi
 }
 
 function replicaPlacementsFor(state: State, node: NodeDefinition) {
-  const replicas = replicasFor(state, node);
-  if (!node.replicaZones?.length) return [];
-  if (replicas <= node.replicaZones.length) return node.replicaZones.slice(0, replicas);
-  const spread = zonesForRegion(node.region);
-  return Array.from({ length: replicas }, (_, index) => node.replicaZones?.[index] ?? spread[index % spread.length]);
+  return replicaPlacements({
+    replicaCount: replicasFor(state, node),
+    declaredZones: node.replicaZones ?? [],
+    regionZones: zonesForRegion(node.region),
+    failedZones: state.failedZones,
+    zoneAware: Boolean(state.autoscaling[node.id]),
+  });
 }
 
 function activeReplicasFor(state: State, node: NodeDefinition) {
@@ -293,12 +296,12 @@ function activeReplicasFor(state: State, node: NodeDefinition) {
   return placements.length ? availableReplicaCount(placements, state.failedZones) : replicas;
 }
 
-function nodeHealth(state: State, node: NodeDefinition): Health {
+function nodeHealth(state: State, node: NodeDefinition, servingTarget?: number): Health {
   if (state.killedNodes.includes(node.id)) return 'failed';
   if (state.failedRegions.includes(node.region)) return 'failed';
   const provisioned = replicasFor(state, node);
   const available = activeReplicasFor(state, node);
-  return replicaHealth(provisioned, available);
+  return replicaHealth(provisioned, available, servingTarget ?? provisioned);
 }
 
 function inferenceCapacity(node: NodeDefinition, replicas: number, batch: number) {
@@ -412,7 +415,6 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   const breachReasons: string[] = [];
 
   for (const node of architecture.nodes) {
-    const health = nodeHealth(scaled, node);
     const provisionedReplicas = replicasFor(scaled, node);
     const replicas = activeReplicasFor(scaled, node);
     const replicaZones = replicaPlacementsFor(scaled, node);
@@ -421,6 +423,11 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     if (architecture.id === 'llm_inference_serving' && node.id === 'pubsub_overflow') {
       demand = nodeMetrics.vertex_rc?.overflowRps ?? 0;
     }
+    const policy = scaled.autoscaling[node.id];
+    const servingTarget = policy
+      ? desiredReplicas(demand, inferenceCapacity(node, 1, state.batching[node.id]?.maxBatch ?? 1).capacity, policy)
+      : provisionedReplicas;
+    const health = nodeHealth(scaled, node, servingTarget);
     let served = demand;
     let queueDepth = 0;
     let overflowRps = 0;
@@ -719,6 +726,8 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
       'Stale agent mutations return STALE_STATE; agent re-reads and adapts.',
       'fail_component is a hard outage. 100% dropout is unreachable packet loss, not a failed component.',
       'preview_change is read-only and does not increment storeVersion.',
+      'reset_scenario restores the loaded reference baseline and is what updates the visible failed overlay. stop_stress_test only ends the run; it is not a reset.',
+      'Autoscaled services place replacement replicas in surviving zones of the same region. Manual replica counts keep static spread, so a failed zone removes those placements.',
     ],
     errorCodes: {
       STALE_STATE: 'Mutation used an outdated expectedVersion after human or simulation changed state.',
@@ -739,7 +748,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
       remediationPaths: [
         'set_ordering_key_parallelism to spread ordering keys',
         'set_batching with higher maxBatch within model limits',
-        'set_autoscaling on Cloud Run services',
+        'set_autoscaling on Cloud Run services — replacement replicas land in surviving zones',
         'add_read_replica for zonal failure path',
       ],
       stressTool: 'run_stress_test',
@@ -755,7 +764,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
       remediationPaths: [
         'set_region_traffic_split to shift traffic to surviving region',
         'set_latency_based_routing to shed traffic from a slow or failed region',
-        'set_autoscaling on surviving regional Cloud Run service',
+        'set_autoscaling on surviving regional Cloud Run service — replacement replicas land in surviving zones',
         'fail_region / restore_region for controlled regional tests',
       ],
       stressTool: 'run_stress_test',
@@ -770,7 +779,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
     remediationPaths: [
       'set_model_traffic_split to a safe share',
       'set_latency_based_routing to shed a slow release candidate',
-      'set_autoscaling on Vertex AI endpoints',
+      'set_autoscaling on Vertex AI endpoints — replacement replicas land in surviving zones',
       'set_batching to trade wait time for throughput',
     ],
     stressTool: 'run_stress_test',
@@ -842,6 +851,7 @@ function architecturePayload(architecture: ArchitectureDefinition, state: State)
       replicaZones: replicaPlacementsFor(state, node),
       provisionedReplicas: replicasFor(state, node),
       availableReplicas: activeReplicasFor(state, node),
+      placement: state.autoscaling[node.id] ? 'autoscaled_surviving_zones' : 'static_spread',
       gcp: gcpResourceProfile(architecture, node),
       fault: state.faults[node.id] ?? null,
       health: state.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy',
@@ -872,6 +882,9 @@ function scenarioPayload(architecture: ArchitectureDefinition, state: State) {
     latencyTargetMs: state.latencyTarget,
     pins: state.pins,
     activeFaults: state.faults,
+    running: state.running,
+    stressActive: state.stressActive,
+    tick: state.tick,
     primaryTrafficPercent: architecture.id === 'multi_region_saas' ? state.regionPrimaryPercent : undefined,
     newModelPercent: architecture.id === 'llm_inference_serving' ? state.modelNewPercent : undefined,
     latencyBasedRouting: architecture.id === 'event_driven_checkout' ? undefined : state.latencyBasedRouting,
@@ -1138,6 +1151,18 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
       execute: (input) => invoke('run_stress_test', { trafficMultiplier: 1 }, Number(input.expectedVersion)),
     },
     {
+      name: 'stop_stress_test',
+      description: 'Stop the running stress test and leave measured failure state. Use reset_scenario to return the visible bench to baseline.',
+      inputSchema: toolInputSchema({ expectedVersion: { type: 'number' } }, ['expectedVersion']),
+      execute: (input) => invoke('stop_stress_test', {}, Number(input.expectedVersion)),
+    },
+    {
+      name: 'reset_scenario',
+      description: 'Reset the loaded reference to its operational baseline: tick 0, stress off, no faults or outages, default load and traffic split. Human pins are kept. Updates the visible topology and gauges.',
+      inputSchema: toolInputSchema({ expectedVersion: { type: 'number' } }, ['expectedVersion']),
+      execute: (input) => invoke('reset_scenario', {}, Number(input.expectedVersion)),
+    },
+    {
       name: 'fail_component',
       description: 'Fail a runtime component as a hard outage. Distinct from set_fault_profile dropout, which is packet loss.',
       inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
@@ -1183,7 +1208,7 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
 
   if (architecture.id === 'event_driven_checkout') {
     tools.push(
-      autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max.', invoke),
+      autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max. When a zone is failed, replacement replicas are placed in surviving zones of the same region.', invoke),
       {
         name: 'set_ordering_key_parallelism',
         description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.',
@@ -1226,7 +1251,7 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
         execute: (input) => invoke('set_region_traffic_split', { primaryPercent: Number(input.primaryPercent) }, Number(input.expectedVersion)),
       },
       latencyRoutingTool('Enable or disable latency-based routing on the global external Application Load Balancer. Traffic shifts toward the faster healthy region.', invoke),
-      autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max.', invoke),
+      autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max. When a zone is failed, replacement replicas are placed in surviving zones of the same region.', invoke),
     );
   }
 
@@ -1239,7 +1264,7 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
         execute: (input) => invoke('set_model_traffic_split', { newModelPercent: Number(input.newModelPercent) }, Number(input.expectedVersion)),
       },
       latencyRoutingTool('Enable or disable latency-based routing on the model router. A slower or failed release candidate sheds traffic back to the stable endpoint.', invoke),
-      autoscalingTool(architecture, 'Set Vertex AI or Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max.', invoke),
+      autoscalingTool(architecture, 'Set Vertex AI or Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max. When a zone is failed, replacement replicas are placed in surviving zones of the same region.', invoke),
       {
         name: 'set_batching',
         description: 'Configure deterministic Vertex AI batching and wait time.',
@@ -1263,7 +1288,28 @@ function applyDomainOp(
       if (architecture.id === 'multi_region_saas' && state.failedRegions.length === 0) next.failedRegions = ['us-east4'];
       return { state: applyMetrics(next, architecture), result: {} };
     }
-    if (op === 'stop_stress_test') return { state: { ...state, running: false }, result: {} };
+    if (op === 'stop_stress_test') {
+      return { state: applyMetrics(withStressStopped(state), architecture), result: { running: false, stressActive: false } };
+    }
+    if (op === 'reset_scenario') {
+      const next = withScenarioReset(state, {
+        peakRps: architecture.defaultPeakRps,
+        budget: architecture.defaultBudget,
+        regionPrimaryPercent: 50,
+        modelNewPercent: 20,
+        replicaOverrides: defaultReplicas(architecture),
+      });
+      return {
+        state: applyMetrics(next, architecture),
+        result: {
+          tick: 0,
+          running: false,
+          stressActive: false,
+          peakRps: next.peakRps,
+          budgetGbp: next.budget,
+        },
+      };
+    }
     if (op === 'set_peak_rps') {
       const peakRps = Math.max(1, Math.round(Number(args.peakRps)));
       return { state: applyMetrics({ ...state, peakRps }, architecture), result: { peakRps } };
@@ -1368,7 +1414,7 @@ function applyDomainOp(
         : { ...state.replicaOverrides, [id]: Math.min(max, Math.max(min, state.replicaOverrides[id] ?? node.replicas)) };
       const next = applyMetrics({ ...state, autoscaling, replicaOverrides }, architecture);
       if (state.pins.includes('budget_hard') && next.sim.costGbpMonth > state.budget) return { state, result: { ok: false, code: 'PINNED_BUDGET', message: 'This change exceeds the human budget limit.' } };
-      return { state: next, result: { id, enabled, min, max, targetUtilPercent, replicas: next.replicaOverrides[id] } };
+      return { state: next, result: { id, enabled, min, max, targetUtilPercent, replicas: next.replicaOverrides[id], availableReplicas: next.nodeMetrics[id]?.availableReplicas, replicaZones: next.nodeMetrics[id]?.replicaZones, health: next.nodeMetrics[id]?.effectiveHealth, placement: enabled ? 'autoscaled_surviving_zones' : 'static_spread' } };
     }
     if (op === 'set_latency_based_routing') {
       if (architecture.id === 'event_driven_checkout') {
@@ -1734,7 +1780,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
     () => gcpTopologyFrame(architecture, state.failedZones, state.failedRegions, state.pins),
     [architecture, state.failedRegions, state.failedZones, state.pins],
   );
-  const hasActiveFailure = state.failedZones.length > 0 || state.failedRegions.length > 0 || state.killedNodes.length > 0 || Object.keys(state.faults).length > 0 || (state.stressActive && !state.sim.sloPass);
+  const hasActiveFailure = benchShowsFailure({ ...state, sloPass: state.sim.sloPass });
   useEffect(() => {
     if (!selectedNode) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1828,7 +1874,7 @@ function NodeInspector({ architecture, node, metric, state, invoke, onClose }: {
           <span>Autoscaling</span>
           <code>{autoscaling ? `${autoscaling.min}–${autoscaling.max} replicas @ ${autoscaling.targetUtilPercent}% target` : 'manual replica count'}</code>
           <button onClick={() => invoke('set_autoscaling', { id: node.id, min: autoscaling?.min ?? 1, max: autoscaling?.max ?? 8, targetUtilPercent: autoscaling?.targetUtilPercent ?? 70, enabled: !autoscaling })}>{autoscaling ? 'Disable autoscaling' : 'Enable autoscaling 1–8'}</button>
-          <small>WebMCP: set_autoscaling</small>
+          <small>WebMCP: set_autoscaling. Failed-zone replacements land in surviving zones.</small>
         </div>
       )}
       <div className={`fault-readout ${fault ? 'active' : ''}`}><span>Injected fault profile</span><code>{fault ? `+${fault.latencyMs} ms latency · ${fault.dropoutPercent}% dropout` : 'none'}</code><small>Packet loss / delay. Distinct from fail_component. WebMCP target: {node.id}</small></div>
@@ -1873,14 +1919,15 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
   return (
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
-      <section className="rail-section rail-live"><div className="section-title"><span>Live controls</span><span className="human-chip">HUMAN / OPEN</span></div><p>These controls stay usable while SITE TOOLS is operating.</p><button className={`stress-button ${state.running ? 'running' : ''}`} onClick={() => state.running ? invoke('stop_stress_test', {}) : invoke('run_stress_test', { trafficMultiplier: 1 })}>{state.running ? 'Stop stress test' : stressLabel}<span className="button-mark" aria-hidden="true" /></button>
+      <section className="rail-section rail-live"><div className="section-title"><span>Live controls</span><span className="human-chip">HUMAN / OPEN</span></div>      <p>These controls stay usable while SITE TOOLS is operating.</p><button className={`stress-button ${state.running ? 'running' : ''}`} onClick={() => state.running ? invoke('stop_stress_test', {}) : invoke('run_stress_test', { trafficMultiplier: 1 })}>{state.running ? 'Stop stress test' : stressLabel}<span className="button-mark" aria-hidden="true" /></button>
+        <button className="pin-stamp policy-stamp" onClick={() => invoke('reset_scenario', {})}><span className="pin-hole" />Reset scenario<span className="pin-state">BASELINE</span></button>
         <RangeControl label="Peak load" value={state.peakRps} min={architecture.id === 'llm_inference_serving' ? 60 : 1000} max={architecture.id === 'event_driven_checkout' ? 18000 : architecture.id === 'multi_region_saas' ? 9000 : 500} step={architecture.id === 'event_driven_checkout' ? 500 : architecture.id === 'llm_inference_serving' ? 10 : 50} suffix=" req/s" onChange={(value) => invoke('set_peak_rps', { peakRps: value })} />
         <RangeControl label="Monthly budget" value={state.budget} min={3000} max={22000} step={100} suffix=" GBP" onChange={(value) => invoke('set_budget', { budget: value })} />
         {architecture.id === 'multi_region_saas' && <RangeControl label="Primary traffic allocation" value={state.regionPrimaryPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_region_traffic_split', { primaryPercent: value })} />}
         {architecture.id === 'llm_inference_serving' && <RangeControl label="New model traffic" value={state.modelNewPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_model_traffic_split', { newModelPercent: value })} />}
         {splitRouting && <button className={`pin-stamp policy-stamp ${state.latencyBasedRouting ? 'active' : ''}`} onClick={() => invoke('set_latency_based_routing', { enabled: !state.latencyBasedRouting })}><span className="pin-hole" />Latency-based routing<span className="pin-state">{state.latencyBasedRouting ? 'ON' : 'OFF'}</span></button>}
       </section>
-      <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><p>Fail one zone to remove only the replicas placed there. Surviving replicas keep serving at reduced capacity.</p><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
+      <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><p>Fail one zone to remove only the replicas placed there. Surviving replicas keep serving at reduced capacity. Autoscaled services reschedule into remaining zones.</p><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
       <section className="rail-section rail-faults"><div className="section-title"><span>Fault injection</span><span className={activeFaults.length ? 'readout-status bad' : 'pin-count'}>{activeFaults.length} active</span></div><p>WebMCP can target any component or connection with latency and request dropout. Effects are traffic-weighted and recorded in the FDR.</p>{activeFaults.length ? <div className="fault-list">{activeFaults.map(([targetId, fault]) => <div key={targetId}><code>{targetId}</code><span>+{formatNumber(fault.latencyMs)} ms · {formatNumber(fault.dropoutPercent, 2)}% drop</span></div>)}<button onClick={() => invoke('clear_all_faults', {})}>Clear all injected faults</button></div> : <div className="fault-empty"><span>NO ACTIVE FAULTS</span><small>Tools: set_fault_profile · clear_fault_profile</small></div>}</section>
       <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><p>Constraints are domain invariants. The graph stays visible when a region or model is excluded.</p><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
       <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
