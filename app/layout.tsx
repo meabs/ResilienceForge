@@ -37,8 +37,14 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" data-webmcp-capability="unknown" data-webmcp-ready="false">
       <body className={`${plexSans.variable} ${plexMono.variable}`}>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){var r=document.documentElement;r.dataset.webmcpCapability=document.modelContext?'supported':'unsupported';r.dataset.webmcpReady='false';})();`,
+          }}
+        />
+        <p id="webmcp-capability" className="sr-only">WebMCP capability: checking.</p>
         <div
           aria-hidden="true"
           dangerouslySetInnerHTML={{ __html: directionContract }}

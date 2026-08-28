@@ -5,7 +5,7 @@ export type ArchitectureId =
 
 export type Region = 'europe-west2' | 'us-east4';
 export type ZoneId = 'europe-west2-a' | 'europe-west2-b' | 'us-east4-a' | 'us-east4-b';
-export type Health = 'healthy' | 'degraded' | 'down';
+export type Health = 'healthy' | 'degraded' | 'unreachable' | 'failed';
 export type PinId =
   | 'keep_pubsub_ordering'
   | 'no_second_region'
@@ -125,7 +125,7 @@ export const architectures: ArchitectureDefinition[] = [
     defaultLatencyTarget: 420,
     defaultAvailabilityTarget: 0.9995,
     nodes: [
-      { id: 'global_alb', kind: 'edge', name: 'Global external ALB', shortName: 'GLOBAL ALB', region: 'europe-west2', replicas: 1, capacityPerReplica: 20000, legalRemediations: ['set_region_traffic_split'], x: 12, y: 54, accent: 'cyan' },
+      { id: 'global_alb', kind: 'edge', name: 'Global external ALB', shortName: 'GLOBAL ALB', region: 'europe-west2', replicas: 1, capacityPerReplica: 20000, legalRemediations: ['set_region_traffic_split', 'set_latency_based_routing'], x: 12, y: 54, accent: 'cyan' },
       { id: 'cloud_run_europe', kind: 'gateway', name: 'Cloud Run ingress / europe-west2', shortName: 'RUN / EU', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 2100, legalRemediations: ['set_autoscaling'], x: 33, y: 33, accent: 'cyan' },
       { id: 'cloud_run_us', kind: 'gateway', name: 'Cloud Run ingress / us-east4', shortName: 'RUN / US', region: 'us-east4', replicas: 2, replicaZones: ['us-east4-a', 'us-east4-b'], capacityPerReplica: 2100, legalRemediations: ['set_autoscaling'], x: 33, y: 75, accent: 'cyan' },
       { id: 'app_europe', kind: 'service', name: 'Cloud Run app / europe-west2', shortName: 'APP / EU', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 1900, legalRemediations: ['set_autoscaling'], x: 51, y: 33, accent: 'acid' },
@@ -165,7 +165,7 @@ export const architectures: ArchitectureDefinition[] = [
     nodes: [
       { id: 'clients', kind: 'client', name: 'Clients', shortName: 'CLIENTS', region: 'europe-west2', replicas: 1, capacityPerReplica: 1000, legalRemediations: [], x: 14, y: 54, accent: 'cyan' },
       { id: 'api_gateway', kind: 'gateway', name: 'API Gateway', shortName: 'API', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 220, legalRemediations: ['set_autoscaling'], x: 32, y: 54, accent: 'cyan' },
-      { id: 'cloud_run_router', kind: 'service', name: 'Cloud Run / Model router', shortName: 'RUN / ROUTER', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 220, legalRemediations: ['set_autoscaling'], x: 50, y: 54, accent: 'orange' },
+      { id: 'cloud_run_router', kind: 'service', name: 'Cloud Run / Model router', shortName: 'RUN / ROUTER', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 220, legalRemediations: ['set_autoscaling', 'set_latency_based_routing'], x: 50, y: 54, accent: 'orange' },
       { id: 'vertex_stable', kind: 'gpu', name: 'Vertex AI endpoint / stable', shortName: 'VERTEX / STABLE', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 120, capacityModel: { concurrency: 6, serviceTimeMs: 45, schedulingEfficiency: 0.9, reservePercent: 10 }, legalRemediations: ['set_autoscaling', 'set_batching'], x: 68, y: 31, accent: 'cyan' },
       { id: 'vertex_rc', kind: 'gpu', name: 'Vertex AI endpoint / release candidate', shortName: 'VERTEX / RC', region: 'europe-west2', replicas: 3, replicaZones: ['europe-west2-a', 'europe-west2-b', 'europe-west2-a'], capacityPerReplica: 80, capacityModel: { concurrency: 4, serviceTimeMs: 45, schedulingEfficiency: 0.9, reservePercent: 10 }, legalRemediations: ['set_autoscaling', 'set_batching', 'set_model_traffic_split'], x: 68, y: 77, accent: 'acid' },
       { id: 'memorystore', kind: 'cache', name: 'Memorystore for Redis / KV cache', shortName: 'MEMORYSTORE', region: 'europe-west2', replicas: 2, replicaZones: ['europe-west2-a', 'europe-west2-b'], capacityPerReplica: 350, legalRemediations: ['set_autoscaling'], x: 86, y: 31, accent: 'violet' },

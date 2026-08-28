@@ -6,6 +6,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -25,12 +26,22 @@ import {
 } from './data';
 import { availableReplicaCount, replicaHealth } from './availability';
 import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './faults';
-import { registerWebMcpTools, type ToolRegistration } from './webmcp';
+import { bindLiveBench, detectCapability, ensureWebMcpRegistration, getWebMcpStatus, liveBench, scheduleWebMcpRelease, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
 import { gcpIconFor } from './gcp-icons';
 import { connectionGeometry, connectionPath, percentBoxStyle, type GraphPoint } from './topology-layout';
+import {
+  assignedTrafficShare,
+  desiredReplicas,
+  effectiveTrafficSplits,
+  type AutoscalingPolicy,
+  type TrafficSplits,
+} from './traffic';
+import { classifyEffectiveHealth, healthLabel, isOutage } from './health-state';
+import { explainFaultContributions, measurementSemantics } from './measurement';
+import { applyPlanSteps, parseRemediationSteps } from './bench-ops';
 
 type Source = 'ui' | 'webmcp' | 'sim';
 
@@ -40,6 +51,7 @@ interface NodeMetric {
   baseServedRps: number;
   capacity: number;
   utilisation: number;
+  trafficShare: number;
   queueDepth?: number;
   overflowRps?: number;
   ttftMs?: number;
@@ -103,6 +115,8 @@ interface State {
   pubsubBatch: number;
   regionPrimaryPercent: number;
   modelNewPercent: number;
+  latencyBasedRouting: boolean;
+  autoscaling: Record<string, AutoscalingPolicy>;
   failedRegions: Region[];
   failedZones: ZoneId[];
   killedNodes: string[];
@@ -124,8 +138,6 @@ interface DomainResult {
   currentVersion: number;
   [key: string]: unknown;
 }
-
-type CommandFn = (state: State) => { state: State; result: DomainResult };
 
 const accentClass = {
   orange: 'accent-orange',
@@ -165,7 +177,7 @@ function defaultReplicas(architecture: ArchitectureDefinition) {
   return Object.fromEntries(architecture.nodes.map((node) => [node.id, node.replicas]));
 }
 
-type SavedControls = Pick<State, 'peakRps' | 'budget' | 'regionPrimaryPercent' | 'modelNewPercent' | 'pins'>;
+type SavedControls = Pick<State, 'peakRps' | 'budget' | 'regionPrimaryPercent' | 'modelNewPercent' | 'pins' | 'latencyBasedRouting' | 'autoscaling'>;
 
 function loadSavedControls(architectureId: string): Partial<SavedControls> | null {
   if (typeof localStorage === 'undefined') return null;
@@ -197,7 +209,11 @@ function createInitialState(architecture: ArchitectureDefinition, saved?: Partia
     orderingKeyShards: 1,
     pubsubBatch: 1,
     regionPrimaryPercent: saved?.regionPrimaryPercent ?? 50,
-    modelNewPercent: saved?.modelNewPercent ?? (architecture.id === 'llm_inference_serving' ? 100 : 20),
+    modelNewPercent: architecture.id === 'llm_inference_serving' && saved?.modelNewPercent === 100
+      ? 20
+      : saved?.modelNewPercent ?? 20,
+    latencyBasedRouting: saved?.latencyBasedRouting ?? false,
+    autoscaling: saved?.autoscaling ?? {},
     failedRegions: [],
     failedZones: [],
     killedNodes: [],
@@ -278,8 +294,8 @@ function activeReplicasFor(state: State, node: NodeDefinition) {
 }
 
 function nodeHealth(state: State, node: NodeDefinition): Health {
-  if (state.killedNodes.includes(node.id)) return 'down';
-  if (state.failedRegions.includes(node.region)) return 'down';
+  if (state.killedNodes.includes(node.id)) return 'failed';
+  if (state.failedRegions.includes(node.region)) return 'failed';
   const provisioned = replicasFor(state, node);
   const available = activeReplicasFor(state, node);
   return replicaHealth(provisioned, available);
@@ -291,6 +307,50 @@ function inferenceCapacity(node: NodeDefinition, replicas: number, batch: number
   if (!profile) return { capacity: replicas * node.capacityPerReplica * batchGain, batchGain };
   const perReplica = profile.concurrency * (1000 / profile.serviceTimeMs) * profile.schedulingEfficiency;
   return { capacity: replicas * perReplica * batchGain, batchGain };
+}
+
+function regionalLatencyMs(metric?: NodeMetric) {
+  const base = 260 + (metric?.injectedLatencyMs ?? 0);
+  const utilisation = metric?.utilisation ?? 0;
+  if (utilisation > 1) return base + 600;
+  if (utilisation > 0.9) return base + 300;
+  return base;
+}
+
+function servingLatencyMs(metric?: NodeMetric, fallback = 350) {
+  return (metric?.ttftMs ?? fallback) + (metric?.injectedLatencyMs ?? 0);
+}
+
+function resolveTrafficSplits(state: State, architecture: ArchitectureDefinition): TrafficSplits {
+  const europe = architecture.nodes.find((node) => node.id === 'app_europe');
+  const us = architecture.nodes.find((node) => node.id === 'app_us');
+  const candidate = architecture.nodes.find((node) => node.id === 'vertex_rc');
+  return effectiveTrafficSplits({
+    architectureId: architecture.id,
+    latencyBasedRouting: state.latencyBasedRouting,
+    regionPrimaryPercent: state.regionPrimaryPercent,
+    modelNewPercent: state.modelNewPercent,
+    europeDown: europe ? isOutage(nodeHealth(state, europe)) : false,
+    usDown: us ? isOutage(nodeHealth(state, us)) : false,
+    usExcluded: state.pins.includes('no_second_region'),
+    candidateDown: candidate ? isOutage(nodeHealth(state, candidate)) : false,
+    europeLatencyMs: regionalLatencyMs(state.nodeMetrics.app_europe),
+    usLatencyMs: regionalLatencyMs(state.nodeMetrics.app_us),
+    stableLatencyMs: servingLatencyMs(state.nodeMetrics.vertex_stable),
+    candidateLatencyMs: servingLatencyMs(state.nodeMetrics.vertex_rc),
+  });
+}
+
+function applyAutoscaling(state: State, architecture: ArchitectureDefinition, splits: TrafficSplits) {
+  const replicaOverrides = { ...state.replicaOverrides };
+  for (const node of architecture.nodes) {
+    const policy = state.autoscaling[node.id];
+    if (!policy) continue;
+    const demand = state.peakRps * assignedTrafficShare(architecture.id, node.id, splits);
+    const batch = state.batching[node.id]?.maxBatch ?? 1;
+    replicaOverrides[node.id] = desiredReplicas(demand, inferenceCapacity(node, 1, batch).capacity, policy);
+  }
+  return replicaOverrides;
 }
 
 function addEdgeMetrics(
@@ -308,14 +368,35 @@ function addEdgeMetrics(
     const rps = Math.max(0, baseRps - faultDroppedRps);
     const droppedRps = Math.max(0, (to?.demandRps ?? 0) - (to?.servedRps ?? 0)) + faultDroppedRps;
     const health: Health =
-      from?.effectiveHealth === 'down' || to?.effectiveHealth === 'down'
-        ? 'down'
+      isOutage(from?.effectiveHealth ?? 'healthy') || isOutage(to?.effectiveHealth ?? 'healthy')
+        ? from?.effectiveHealth === 'failed' || to?.effectiveHealth === 'failed'
+          ? 'failed'
+          : 'unreachable'
         : fault.latencyMs > 0 || fault.dropoutPercent > 0 || state.stressActive && (droppedRps > 0 || (to?.utilisation ?? 0) > 0.9)
-          ? 'degraded'
+          ? fault.dropoutPercent >= 100 ? 'unreachable' : 'degraded'
           : 'healthy';
     edgeMetrics[edge.id] = { rps, droppedRps, health, injectedLatencyMs: fault.latencyMs, dropoutPercent: fault.dropoutPercent };
   }
   return edgeMetrics;
+}
+
+function collectWeightedFaults(state: State, architecture: ArchitectureDefinition, nodeMetrics: Record<string, NodeMetric>) {
+  return [
+    ...architecture.nodes.flatMap((node) => {
+      const fault = state.faults[node.id];
+      const metric = nodeMetrics[node.id];
+      if (!fault || !metric || fault.latencyMs === 0 && fault.dropoutPercent === 0) return [];
+      const isNonCriticalLlmSupport = architecture.id === 'llm_inference_serving' && ['memorystore', 'pubsub_overflow'].includes(node.id);
+      const trafficShare = isNonCriticalLlmSupport ? 0 : Math.min(1, metric.demandRps / Math.max(state.peakRps, 1));
+      return [{ targetId: node.id, ...fault, trafficShare }];
+    }),
+    ...architecture.edges.flatMap((edge) => {
+      const fault = state.faults[edge.id];
+      const downstream = nodeMetrics[edge.to];
+      if (!fault || !downstream || fault.latencyMs === 0 && fault.dropoutPercent === 0) return [];
+      return [{ targetId: edge.id, ...fault, trafficShare: Math.min(1, downstream.demandRps / Math.max(state.peakRps, 1)) }];
+    }),
+  ];
 }
 
 function applyMetrics(state: State, architecture: ArchitectureDefinition): State {
@@ -324,17 +405,23 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   let p95Ms = 260;
   let rpsAchieved = state.peakRps;
   let errorRate = 0;
-  let cost = 4200 + Object.values(state.replicaOverrides).reduce((sum, value) => sum + value * 95, 0);
+  const splits = resolveTrafficSplits(state, architecture);
+  const replicaOverrides = applyAutoscaling(state, architecture, splits);
+  const scaled: State = { ...state, replicaOverrides };
+  let cost = 4200 + Object.values(replicaOverrides).reduce((sum, value) => sum + value * 95, 0);
   const breachReasons: string[] = [];
 
   for (const node of architecture.nodes) {
-    const health = nodeHealth(state, node);
-    const provisionedReplicas = replicasFor(state, node);
-    const replicas = activeReplicasFor(state, node);
-    const replicaZones = replicaPlacementsFor(state, node);
+    const health = nodeHealth(scaled, node);
+    const provisionedReplicas = replicasFor(scaled, node);
+    const replicas = activeReplicasFor(scaled, node);
+    const replicaZones = replicaPlacementsFor(scaled, node);
     let capacity = replicas * node.capacityPerReplica;
-    let demand = state.peakRps;
-    let served = state.peakRps;
+    let demand = state.peakRps * assignedTrafficShare(architecture.id, node.id, splits);
+    if (architecture.id === 'llm_inference_serving' && node.id === 'pubsub_overflow') {
+      demand = nodeMetrics.vertex_rc?.overflowRps ?? 0;
+    }
+    let served = demand;
     let queueDepth = 0;
     let overflowRps = 0;
     let ttftMs: number | undefined;
@@ -354,7 +441,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       cost += state.orderingKeyShards > 1 ? 650 : 0;
     }
 
-    if (architecture.id === 'event_driven_checkout' && node.id === 'cloud_sql' && health === 'down') {
+    if (architecture.id === 'event_driven_checkout' && node.id === 'cloud_sql' && health === 'failed') {
       if (state.readReplicaAdded) {
         capacity = 8000;
       } else if (state.stressActive) {
@@ -364,63 +451,65 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     }
 
     if (architecture.id === 'multi_region_saas') {
-      const isPrimary = node.region === 'europe-west2';
-      const assignedShare = isPrimary ? state.regionPrimaryPercent / 100 : 1 - state.regionPrimaryPercent / 100;
-      demand = state.peakRps * assignedShare;
+      const isPrimary = node.region === 'europe-west2' && node.id !== 'global_alb' && node.id !== 'memorystore';
       if (state.stressActive || state.failedRegions.length > 0) {
-        if (health === 'down' || state.pins.includes('no_second_region') && !isPrimary) {
+        if (health === 'failed' || state.pins.includes('no_second_region') && node.region === 'us-east4') {
           served = 0;
-        } else {
+        } else if (node.id !== 'global_alb' && node.id !== 'memorystore') {
           served = Math.min(demand, capacity);
         }
         overflowRps = Math.max(0, demand - served);
-        if (overflowRps > 0) breachReasons.push(isPrimary ? 'PRIMARY CAPACITY' : 'REGION TRAFFIC LOST');
+        if (overflowRps > 0 && node.id !== 'global_alb' && node.id !== 'memorystore') {
+          breachReasons.push(isPrimary ? 'PRIMARY CAPACITY' : 'REGION TRAFFIC LOST');
+        }
       }
-      if (health === 'down') served = 0;
+      if (health === 'failed') served = 0;
     }
 
     if (architecture.id === 'llm_inference_serving' && (node.id === 'vertex_stable' || node.id === 'vertex_rc')) {
       const isNew = node.id === 'vertex_rc';
-      const share = isNew ? state.modelNewPercent / 100 : 1 - state.modelNewPercent / 100;
-      demand = state.peakRps * share;
       const batch = state.batching[node.id]?.maxBatch ?? 1;
       const inference = inferenceCapacity(node, replicas, batch);
       capacity = inference.capacity;
+      const utilisation = demand / Math.max(capacity, 1);
+      ttftMs = utilisation < 0.7 ? 350 : utilisation <= 0.9 ? 700 : utilisation <= 1 ? 1500 : 3000;
+      if (state.batching[node.id]) ttftMs += state.batching[node.id].waitMs;
       if (state.stressActive) {
         served = Math.min(demand, capacity);
         overflowRps = Math.max(0, demand - served);
-        const utilisation = demand / Math.max(capacity, 1);
-        ttftMs = utilisation < 0.7 ? 350 : utilisation <= 0.9 ? 700 : utilisation <= 1 ? 1500 : 3000;
-        if (state.batching[node.id]) ttftMs += state.batching[node.id].waitMs;
         if (isNew) breachReasons.push(...releaseEndpointReasons(utilisation, overflowRps));
         p95Ms = Math.max(p95Ms, ttftMs);
-      } else {
-        ttftMs = 350;
       }
     }
 
-    if (health === 'down') served = 0;
+    if (health === 'failed') served = 0;
     const baseServedRps = served;
     const dropoutRps = baseServedRps * fault.dropoutPercent / 100;
     served = Math.max(0, baseServedRps - dropoutRps);
-    const activeDemand = state.stressActive ? demand : 0;
-    const activeServed = state.stressActive ? served : 0;
+    const activeDemand = demand;
+    const activeServed = health === 'failed' ? 0 : state.stressActive || fault.dropoutPercent > 0 ? served : demand;
     const utilisation = activeDemand > 0 ? Math.min(1.5, activeDemand / Math.max(capacity, 1)) : 0;
-    const effectiveHealth: Health =
-      health === 'down' ? 'down' : health === 'degraded' || fault.latencyMs > 0 || fault.dropoutPercent > 0 || state.stressActive && utilisation > 0.9 ? 'degraded' : 'healthy';
+    const effectiveHealth = classifyEffectiveHealth({
+      topologyHealth: health,
+      dropoutPercent: fault.dropoutPercent,
+      latencyMs: fault.latencyMs,
+      utilisation,
+      stressActive: state.stressActive,
+    });
 
     nodeMetrics[node.id] = {
       demandRps: activeDemand,
       servedRps: activeServed,
-      baseServedRps: state.stressActive ? baseServedRps : 0,
+      baseServedRps: state.stressActive ? baseServedRps : (health === 'failed' ? 0 : demand),
       capacity,
       utilisation,
+      trafficShare: Math.min(1, activeDemand / Math.max(state.peakRps, 1)),
       queueDepth: queueDepth || undefined,
       overflowRps: overflowRps || undefined,
       ttftMs,
       effectiveHealth,
       provisionedReplicas,
-      availableReplicas: health === 'down' ? 0 : replicas,
+      availableReplicas: health === 'failed' ? 0 : replicas,
       replicaZones,
       injectedLatencyMs: fault.latencyMs,
       dropoutPercent: fault.dropoutPercent,
@@ -443,7 +532,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
       availability = rpsAchieved / Math.max(state.peakRps, 1);
       errorRate = 1 - availability;
     }
-    if (db?.effectiveHealth === 'down' && !state.readReplicaAdded) {
+    if (db?.effectiveHealth === 'failed' && !state.readReplicaAdded) {
       availability = Math.min(availability, 0.18);
       errorRate = 1 - availability;
     }
@@ -474,22 +563,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
   }
   const edgeMetrics = addEdgeMetrics(state, architecture, nodeMetrics);
   if (state.stressActive) {
-    const weightedFaults = [
-      ...architecture.nodes.flatMap((node) => {
-        const fault = state.faults[node.id];
-        const metric = nodeMetrics[node.id];
-        if (!fault || !metric || fault.latencyMs === 0 && fault.dropoutPercent === 0) return [];
-        const isNonCriticalLlmSupport = architecture.id === 'llm_inference_serving' && ['memorystore', 'pubsub_overflow'].includes(node.id);
-        const trafficShare = isNonCriticalLlmSupport ? 0 : Math.min(1, metric.demandRps / Math.max(state.peakRps, 1));
-        return [{ ...fault, trafficShare }];
-      }),
-      ...architecture.edges.flatMap((edge) => {
-        const fault = state.faults[edge.id];
-        const downstream = nodeMetrics[edge.to];
-        if (!fault || !downstream || fault.latencyMs === 0 && fault.dropoutPercent === 0) return [];
-        return [{ ...fault, trafficShare: Math.min(1, downstream.demandRps / Math.max(state.peakRps, 1)) }];
-      }),
-    ];
+    const weightedFaults = collectWeightedFaults(state, architecture, nodeMetrics);
     const faultImpact = aggregateFaultImpact(weightedFaults);
     availability = Math.max(0, Math.min(1, availability * faultImpact.availabilityMultiplier));
     rpsAchieved = Math.max(0, rpsAchieved * faultImpact.availabilityMultiplier);
@@ -515,6 +589,7 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
 
   return {
     ...state,
+    replicaOverrides,
     nodeMetrics,
     edgeMetrics,
     sim: {
@@ -638,10 +713,12 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
     signatureLoop: [
       'Human selects reference from Catalogue — no WebMCP tool can load a reference.',
       'Human configures scenario controls and pins on the Bench.',
-      'Agent discovers site tools, reads semantic state, runs stress or failure.',
-      'Agent begins legal remediation with expectedVersion from the latest read.',
+      'Agent waits for get_webmcp_status.toolsReady or data-webmcp-ready=true, then reads get_bench_snapshot.',
+      'Agent begins legal remediation with expectedVersion from that snapshot, or apply_remediation_plan for compound steps.',
       'Human may change ordinary controls at any time while the agent is operating.',
       'Stale agent mutations return STALE_STATE; agent re-reads and adapts.',
+      'fail_component is a hard outage. 100% dropout is unreachable packet loss, not a failed component.',
+      'preview_change is read-only and does not increment storeVersion.',
     ],
     errorCodes: {
       STALE_STATE: 'Mutation used an outdated expectedVersion after human or simulation changed state.',
@@ -677,6 +754,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
       ordinaryHumanControls: ['primaryTrafficPercent', 'peakRps', 'budgetGbp'],
       remediationPaths: [
         'set_region_traffic_split to shift traffic to surviving region',
+        'set_latency_based_routing to shed traffic from a slow or failed region',
         'set_autoscaling on surviving regional Cloud Run service',
         'fail_region / restore_region for controlled regional tests',
       ],
@@ -691,6 +769,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
     ordinaryHumanControls: ['newModelPercent', 'peakRps', 'budgetGbp'],
     remediationPaths: [
       'set_model_traffic_split to a safe share',
+      'set_latency_based_routing to shed a slow release candidate',
       'set_autoscaling on Vertex AI endpoints',
       'set_batching to trade wait time for throughput',
     ],
@@ -699,12 +778,16 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
 }
 
 const READ_ONLY_TOOLS = new Set([
+  'get_webmcp_status',
+  'get_capability',
   'get_bench_guide',
   'get_architecture',
   'get_scenario',
   'get_live_metrics',
   'get_root_cause_analysis',
   'get_constraints',
+  'get_bench_snapshot',
+  'preview_change',
 ]);
 
 function annotateTools(tools: ToolRegistration[]): ToolRegistration[] {
@@ -727,55 +810,235 @@ function rootCauseFor(architecture: ArchitectureDefinition, state: State): RootC
     faults: Object.entries(state.faults).map(([targetId, fault]) => ({ targetId, targetName: nodeNames.get(targetId) ?? edgeNames.get(targetId) ?? targetId, targetType: edgeNames.has(targetId) ? 'connection' : 'component', ...fault })),
     overloadedComponents: architecture.nodes.flatMap((node) => {
       const metric = state.nodeMetrics[node.id];
-      return metric && (metric.utilisation >= 1 || (metric.overflowRps ?? 0) > 0) ? [{ id: node.id, name: node.name, utilisation: metric.utilisation, overflowRps: metric.overflowRps ?? 0 }] : [];
+      return state.stressActive && metric && (metric.utilisation >= 1 || (metric.overflowRps ?? 0) > 0) ? [{ id: node.id, name: node.name, utilisation: metric.utilisation, overflowRps: metric.overflowRps ?? 0 }] : [];
     }),
     impact: { availability: state.sim.availability, latencyMs: state.sim.p95Ms, errorRate: state.sim.errorRate, achievedRps: state.sim.rpsAchieved, sloPass: state.sim.sloPass, breachReasons: state.sim.breachReasons },
   });
 }
 
-function makeTools(
+function liveState() {
+  return liveBench.getState() as State | null;
+}
+
+function liveInvoke(op: string, args: Record<string, unknown>, expectedVersion?: number) {
+  return liveBench.invoke(op, args, expectedVersion) as DomainResult;
+}
+
+function liveRead(op: string, args: Record<string, unknown>, payload: Record<string, unknown>) {
+  return liveBench.read(op, args, payload) as DomainResult;
+}
+
+function architecturePayload(architecture: ArchitectureDefinition, state: State) {
+  return {
+    architectureId: architecture.id,
+    platform: architecture.platform,
+    referenceSpec: architecture.referenceSpec,
+    referenceUrl: architecture.referenceUrl,
+    nodes: architecture.nodes.map((node) => ({
+      id: node.id,
+      name: node.name,
+      kind: node.kind,
+      region: node.region,
+      replicaZones: replicaPlacementsFor(state, node),
+      provisionedReplicas: replicasFor(state, node),
+      availableReplicas: activeReplicasFor(state, node),
+      gcp: gcpResourceProfile(architecture, node),
+      fault: state.faults[node.id] ?? null,
+      health: state.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy',
+      killed: state.killedNodes.includes(node.id),
+    })),
+    edges: architecture.edges.map((edge) => ({
+      ...edge,
+      fault: state.faults[edge.id] ?? null,
+      health: state.edgeMetrics[edge.id]?.health ?? 'healthy',
+    })),
+    failedRegions: state.failedRegions,
+    failedZones: state.failedZones,
+    killedComponents: state.killedNodes,
+    excludedRegions: state.pins.includes('no_second_region') ? ['us-east4'] : [],
+    storeVersion: state.version,
+  };
+}
+
+function scenarioPayload(architecture: ArchitectureDefinition, state: State) {
+  return {
+    architectureId: architecture.id,
+    platform: architecture.platform,
+    referenceSpec: architecture.referenceSpec,
+    referenceUrl: architecture.referenceUrl,
+    peakRps: state.peakRps,
+    budgetGbp: state.budget,
+    availabilityTarget: state.availabilityTarget,
+    latencyTargetMs: state.latencyTarget,
+    pins: state.pins,
+    activeFaults: state.faults,
+    primaryTrafficPercent: architecture.id === 'multi_region_saas' ? state.regionPrimaryPercent : undefined,
+    newModelPercent: architecture.id === 'llm_inference_serving' ? state.modelNewPercent : undefined,
+    latencyBasedRouting: architecture.id === 'event_driven_checkout' ? undefined : state.latencyBasedRouting,
+    autoscaling: state.autoscaling,
+    effectivePrimaryTrafficPercent: architecture.id === 'multi_region_saas' ? Math.round((state.nodeMetrics.app_europe?.trafficShare ?? 0) * 100) : undefined,
+    effectiveNewModelPercent: architecture.id === 'llm_inference_serving' ? Math.round((state.nodeMetrics.vertex_rc?.trafficShare ?? 0) * 100) : undefined,
+    storeVersion: state.version,
+  };
+}
+
+function metricsPayload(architecture: ArchitectureDefinition, state: State) {
+  const weighted = collectWeightedFaults(state, architecture, state.nodeMetrics);
+  const observations = architecture.nodes.flatMap((node) => {
+    const metric = state.nodeMetrics[node.id];
+    if (!metric) return [];
+    const items: Record<string, unknown>[] = [];
+    if (state.stressActive && metric.utilisation > 1) items.push({ code: 'CAPACITY_BREACH', nodeId: node.id, demand: metric.demandRps, capacity: metric.capacity, unit: 'req/s' });
+    if (state.stressActive && ((metric.queueDepth ?? 0) > 0 || (metric.overflowRps ?? 0) > 0)) items.push({ code: 'QUEUE_PRESSURE', nodeId: node.id, depth: metric.queueDepth ?? 0, overflow: metric.overflowRps ?? 0, unit: 'req/s' });
+    if (metric.effectiveHealth === 'failed') items.push({ code: 'COMPONENT_FAILED', nodeId: node.id, health: 'failed' });
+    if (metric.effectiveHealth === 'unreachable') items.push({ code: 'COMPONENT_UNREACHABLE', nodeId: node.id, health: 'unreachable', dropoutPercent: metric.dropoutPercent });
+    if (metric.injectedLatencyMs > 0 || metric.dropoutPercent > 0) items.push({ code: 'INJECTED_FAULT', nodeId: node.id, latencyMs: metric.injectedLatencyMs, dropoutPercent: metric.dropoutPercent, dropoutRps: metric.dropoutRps });
+    return items;
+  });
+  return {
+    sim: state.sim,
+    nodeMetrics: Object.fromEntries(Object.entries(state.nodeMetrics).map(([id, metric]) => [id, { ...metric, headroom: Math.max(0, metric.capacity - metric.demandRps) }])),
+    edgeMetrics: state.edgeMetrics,
+    observations,
+    measurement: measurementSemantics(state.stressActive),
+    faultContributions: explainFaultContributions(weighted),
+    faultAccountingNote: state.stressActive
+      ? 'System latency and availability include traffic-weighted fault contributions on this tick.'
+      : 'Fault contributions describe the current routing assignment. System gauges apply them only while stress is active.',
+    storeVersion: state.version,
+  };
+}
+
+function constraintsPayload(architecture: ArchitectureDefinition, state: State) {
+  return {
+    provider: architecture.platform,
+    constraints: architecture.id === 'event_driven_checkout'
+      ? [
+          { id: 'pubsub-ordering-key-throughput', sourceType: 'provider_limit', metric: 'Publisher throughput per ordering key', value: 1, unit: 'MB/s', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/pubsub/docs/quotas', notes: 'Google documents a 1 MBps publishing limit for each ordering key.' },
+          { id: 'pubsub-ordering-key-scope', sourceType: 'provider_behavior', metric: 'Ordering guarantee', value: 'same key / same region / ordering enabled', unit: 'configuration', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/pubsub/docs/ordering', notes: 'Related messages must use the same key and publish region.' },
+          { id: 'pubsub-bench-event-rate', sourceType: 'model_assumption', metric: 'Bench ordered events', value: 300, unit: 'events/s/key', sourceDate: '2026-08-27', notes: 'Synthetic 3.3 KB event profile used to make the provider limit interactive.' },
+        ]
+      : architecture.id === 'llm_inference_serving'
+        ? [
+            { id: 'vertex-ai-traffic-split', sourceType: 'provider_behavior', metric: 'Endpoint traffic split', value: 100, unit: '% total', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1', notes: 'Deployed-model percentages must add up to 100.' },
+            { id: 'api-gateway-payload-size', sourceType: 'provider_limit', metric: 'API Gateway request / response size', value: 32, unit: 'MB', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/api-gateway/docs/quotas', notes: 'Streaming is not supported through API Gateway.' },
+            { id: 'vertex-ai-stable-capacity', sourceType: 'model_assumption', metric: 'Vertex AI stable endpoint capacity', value: 120, unit: 'inference/s/replica', sourceDate: '2026-08-27', notes: 'Synthetic serving capacity; verify against the selected model and machine type.' },
+            { id: 'vertex-ai-release-capacity', sourceType: 'model_assumption', metric: 'Vertex AI release endpoint capacity', value: 80, unit: 'inference/s/replica', sourceDate: '2026-08-27', notes: 'Synthetic serving capacity; verify against the selected model and machine type.' },
+          ]
+        : [
+            { id: 'cloud-run-concurrency', sourceType: 'provider_limit', metric: 'Maximum concurrency per instance', value: 1000, unit: 'concurrent requests', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/run/docs/configuring', notes: 'The benchmark capacity is still a workload assumption, not a direct RPS conversion.' },
+            { id: 'cloud-run-request-timeout', sourceType: 'provider_limit', metric: 'Maximum request timeout', value: 60, unit: 'minutes', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/run/docs/configuring/request-timeout' },
+            { id: 'cloud-sql-cross-region-replica', sourceType: 'provider_behavior', metric: 'Cross-region replication', value: 'asynchronous', unit: 'replication mode', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/sql/docs/postgres/intro-to-cloud-sql-disaster-recovery?hl=en', notes: 'Promotion is intentional; regional failover can have non-zero RPO.' },
+            { id: 'memorystore-standard-ha', sourceType: 'provider_behavior', metric: 'Memorystore Standard Tier', value: 99.9, unit: '% availability SLA', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/memorystore/docs/redis/memorystore-for-redis-overview', notes: 'Cross-zone replication and automatic failover; up to five read replicas when enabled.' },
+          ],
+    publicListPriceEstimate: { gbpMonth: state.sim.costGbpMonth, sourceDate: '2026-08-27', assumptions: ['Curated estimate', 'Synthetic replica mix'] },
+    storeVersion: state.version,
+  };
+}
+
+function snapshotPayload(architecture: ArchitectureDefinition, state: State) {
+  return {
+    capturedAt: new Date().toISOString(),
+    simulationTime: simulationTime(state.tick),
+    tick: state.tick,
+    storeVersion: state.version,
+    scenario: scenarioPayload(architecture, state),
+    topology: architecturePayload(architecture, state),
+    metrics: metricsPayload(architecture, state),
+    constraints: constraintsPayload(architecture, state),
+    rca: rootCauseFor(architecture, state),
+  };
+}
+
+function previewDelta(before: State, after: State) {
+  return {
+    storeVersionUnchanged: before.version === after.version,
+    availability: { before: before.sim.availability, after: after.sim.availability, delta: after.sim.availability - before.sim.availability },
+    latencyMs: { before: before.sim.p95Ms, after: after.sim.p95Ms, delta: after.sim.p95Ms - before.sim.p95Ms },
+    errorRate: { before: before.sim.errorRate, after: after.sim.errorRate, delta: after.sim.errorRate - before.sim.errorRate },
+    achievedRps: { before: before.sim.rpsAchieved, after: after.sim.rpsAchieved, delta: after.sim.rpsAchieved - before.sim.rpsAchieved },
+    costGbpMonth: { before: before.sim.costGbpMonth, after: after.sim.costGbpMonth, delta: after.sim.costGbpMonth - before.sim.costGbpMonth },
+    sloPass: { before: before.sim.sloPass, after: after.sim.sloPass },
+    rcaStatus: { before: '', after: '' },
+  };
+}
+
+function autoscalingTool(
   architecture: ArchitectureDefinition,
-  getState: () => State,
+  description: string,
   invoke: (op: string, args: Record<string, unknown>, expectedVersion?: number) => DomainResult,
-  read: (op: string, args: Record<string, unknown>, payload: Record<string, unknown>) => DomainResult,
-): ToolRegistration[] {
+): ToolRegistration {
+  return {
+    name: 'set_autoscaling',
+    description,
+    inputSchema: toolInputSchema({
+      id: nodeIdProperty(architecture),
+      min: { type: 'number', minimum: 1, maximum: 32 },
+      max: { type: 'number', minimum: 1, maximum: 32 },
+      targetUtilPercent: { type: 'number', minimum: 10, maximum: 90 },
+      enabled: { type: 'boolean' },
+      expectedVersion: { type: 'number' },
+    }, ['id', 'min', 'max', 'expectedVersion']),
+    execute: (input) => invoke('set_autoscaling', {
+      id: String(input.id),
+      min: Number(input.min),
+      max: Number(input.max),
+      targetUtilPercent: input.targetUtilPercent === undefined ? undefined : Number(input.targetUtilPercent),
+      enabled: input.enabled === undefined ? true : Boolean(input.enabled),
+    }, Number(input.expectedVersion)),
+  };
+}
+
+function latencyRoutingTool(
+  description: string,
+  invoke: (op: string, args: Record<string, unknown>, expectedVersion?: number) => DomainResult,
+): ToolRegistration {
+  return {
+    name: 'set_latency_based_routing',
+    description,
+    inputSchema: toolInputSchema({ enabled: { type: 'boolean' }, expectedVersion: { type: 'number' } }, ['enabled', 'expectedVersion']),
+    execute: (input) => invoke('set_latency_based_routing', { enabled: Boolean(input.enabled) }, Number(input.expectedVersion)),
+  };
+}
+
+function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
+  const invoke = (op: string, args: Record<string, unknown>, expectedVersion?: number) => liveInvoke(op, args, expectedVersion);
   const tools: ToolRegistration[] = [
+    {
+      name: 'get_webmcp_status',
+      description: 'Read WebMCP capability, toolsReady, session id, and registered tool names. Call this before other tools if discovery looks incomplete.',
+      inputSchema: toolInputSchema({}),
+      execute: () => {
+        const status = getWebMcpStatus();
+        return liveRead('get_webmcp_status', {}, { ...status, toolsReady: status.ready });
+      },
+    },
+    {
+      name: 'get_capability',
+      description: 'Alias of get_webmcp_status. Use html[data-webmcp-capability] and html[data-webmcp-ready] for a pre-discovery signal.',
+      inputSchema: toolInputSchema({}),
+      execute: () => {
+        const status = getWebMcpStatus();
+        return liveRead('get_capability', {}, { ...status, toolsReady: status.ready });
+      },
+    },
     {
       name: 'get_bench_guide',
       description: 'Read the signature human-agent loop, valid remediation paths, pin semantics, and error codes for this bench.',
       inputSchema: toolInputSchema({}),
-      execute: () => read('get_bench_guide', {}, { guide: benchGuideFor(architecture), storeVersion: getState().version }),
+      execute: () => {
+        const state = liveState();
+        return liveRead('get_bench_guide', {}, { guide: benchGuideFor(architecture), storeVersion: state?.version ?? 0 });
+      },
     },
     {
       name: 'get_architecture',
       description: 'Read the current semantic topology, health, failures, exclusions, and store version.',
       inputSchema: toolInputSchema({}),
       execute: () => {
-        const state = getState();
-        const result = read('get_architecture', {}, {
-          architectureId: architecture.id,
-          platform: architecture.platform,
-          referenceSpec: architecture.referenceSpec,
-          referenceUrl: architecture.referenceUrl,
-          nodes: architecture.nodes.map((node) => ({
-            id: node.id,
-            name: node.name,
-            kind: node.kind,
-            region: node.region,
-            replicaZones: replicaPlacementsFor(state, node),
-            provisionedReplicas: replicasFor(state, node),
-            availableReplicas: activeReplicasFor(state, node),
-            gcp: gcpResourceProfile(architecture, node),
-            fault: state.faults[node.id] ?? null,
-            health: state.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy',
-          })),
-          edges: architecture.edges.map((edge) => ({ ...edge, fault: state.faults[edge.id] ?? null })),
-          failedRegions: state.failedRegions,
-          failedZones: state.failedZones,
-          excludedRegions: state.pins.includes('no_second_region') ? ['us-east4'] : [],
-          storeVersion: state.version,
-        });
-        return result;
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        return liveRead('get_architecture', {}, architecturePayload(architecture, state));
       },
     },
     {
@@ -783,85 +1046,78 @@ function makeTools(
       description: 'Read current human scenario controls, targets, pins, and store version.',
       inputSchema: toolInputSchema({}),
       execute: () => {
-        const state = getState();
-        return read('get_scenario', {}, {
-          architectureId: architecture.id,
-          platform: architecture.platform,
-          referenceSpec: architecture.referenceSpec,
-          referenceUrl: architecture.referenceUrl,
-          peakRps: state.peakRps,
-          budgetGbp: state.budget,
-          availabilityTarget: state.availabilityTarget,
-          latencyTargetMs: state.latencyTarget,
-          pins: state.pins,
-          activeFaults: state.faults,
-          primaryTrafficPercent: architecture.id === 'multi_region_saas' ? state.regionPrimaryPercent : undefined,
-          newModelPercent: architecture.id === 'llm_inference_serving' ? state.modelNewPercent : undefined,
-          storeVersion: state.version,
-        });
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        return liveRead('get_scenario', {}, scenarioPayload(architecture, state));
       },
     },
     {
       name: 'get_live_metrics',
-      description: 'Read demand, served throughput, capacity, utilisation, headroom, queue or overflow, TTFT, and factual observations.',
+      description: 'Read demand, served throughput, capacity, utilisation, traffic share, measurement semantics, and traffic-weighted fault contributions.',
       inputSchema: toolInputSchema({}),
       execute: () => {
-        const state = getState();
-        const observations = architecture.nodes.flatMap((node) => {
-          const metric = state.nodeMetrics[node.id];
-          if (!metric) return [];
-          const items: Record<string, unknown>[] = [];
-          if (metric.utilisation > 1) items.push({ code: 'CAPACITY_BREACH', nodeId: node.id, demand: metric.demandRps, capacity: metric.capacity, unit: 'req/s' });
-          if ((metric.queueDepth ?? 0) > 0 || (metric.overflowRps ?? 0) > 0) items.push({ code: 'QUEUE_PRESSURE', nodeId: node.id, depth: metric.queueDepth ?? 0, overflow: metric.overflowRps ?? 0, unit: 'req/s' });
-          if (metric.injectedLatencyMs > 0 || metric.dropoutPercent > 0) items.push({ code: 'INJECTED_FAULT', nodeId: node.id, latencyMs: metric.injectedLatencyMs, dropoutPercent: metric.dropoutPercent, dropoutRps: metric.dropoutRps });
-          return items;
-        });
-        return read('get_live_metrics', {}, {
-          sim: state.sim,
-          nodeMetrics: Object.fromEntries(Object.entries(state.nodeMetrics).map(([id, metric]) => [id, { ...metric, headroom: Math.max(0, metric.capacity - metric.demandRps) }])),
-          edgeMetrics: state.edgeMetrics,
-          observations,
-          storeVersion: state.version,
-        });
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        return liveRead('get_live_metrics', {}, metricsPayload(architecture, state));
       },
     },
     {
       name: 'get_root_cause_analysis',
-      description: 'Explain the current failure using live topology, fault, capacity, SLO, and Flight Data Recorder evidence. This tool is read-only and returns recovery actions supported by the bench.',
+      description: 'Explain the current failure using live topology, fault, capacity, SLO, and Flight Data Recorder evidence. Recommended actions include expected effect, prerequisites, trade-offs, and recovery kind.',
       inputSchema: toolInputSchema({}),
       execute: () => {
-        const state = getState();
-        return read('get_root_cause_analysis', {}, { analysis: rootCauseFor(architecture, state) });
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        return liveRead('get_root_cause_analysis', {}, { analysis: rootCauseFor(architecture, state) });
       },
     },
     {
       name: 'get_constraints',
       description: 'Read applicable provider-limit and model-assumption records with source dates and provenance.',
       inputSchema: toolInputSchema({}),
-      execute: () => read('get_constraints', {}, {
-        provider: architecture.platform,
-        constraints: architecture.id === 'event_driven_checkout'
-          ? [
-              { id: 'pubsub-ordering-key-throughput', sourceType: 'provider_limit', metric: 'Publisher throughput per ordering key', value: 1, unit: 'MB/s', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/pubsub/docs/quotas', notes: 'Google documents a 1 MBps publishing limit for each ordering key.' },
-              { id: 'pubsub-ordering-key-scope', sourceType: 'provider_behavior', metric: 'Ordering guarantee', value: 'same key / same region / ordering enabled', unit: 'configuration', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/pubsub/docs/ordering', notes: 'Related messages must use the same key and publish region.' },
-              { id: 'pubsub-bench-event-rate', sourceType: 'model_assumption', metric: 'Bench ordered events', value: 300, unit: 'events/s/key', sourceDate: '2026-08-27', notes: 'Synthetic 3.3 KB event profile used to make the provider limit interactive.' },
-            ]
-          : architecture.id === 'llm_inference_serving'
-            ? [
-                { id: 'vertex-ai-traffic-split', sourceType: 'provider_behavior', metric: 'Endpoint traffic split', value: 100, unit: '% total', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/vertex-ai/docs/reference/rpc/google.cloud.aiplatform.v1', notes: 'Deployed-model percentages must add up to 100.' },
-                { id: 'api-gateway-payload-size', sourceType: 'provider_limit', metric: 'API Gateway request / response size', value: 32, unit: 'MB', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/api-gateway/docs/quotas', notes: 'Streaming is not supported through API Gateway.' },
-                { id: 'vertex-ai-stable-capacity', sourceType: 'model_assumption', metric: 'Vertex AI stable endpoint capacity', value: 120, unit: 'inference/s/replica', sourceDate: '2026-08-27', notes: 'Synthetic serving capacity; verify against the selected model and machine type.' },
-                { id: 'vertex-ai-release-capacity', sourceType: 'model_assumption', metric: 'Vertex AI release endpoint capacity', value: 80, unit: 'inference/s/replica', sourceDate: '2026-08-27', notes: 'Synthetic serving capacity; verify against the selected model and machine type.' },
-              ]
-            : [
-                { id: 'cloud-run-concurrency', sourceType: 'provider_limit', metric: 'Maximum concurrency per instance', value: 1000, unit: 'concurrent requests', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/run/docs/configuring', notes: 'The benchmark capacity is still a workload assumption, not a direct RPS conversion.' },
-                { id: 'cloud-run-request-timeout', sourceType: 'provider_limit', metric: 'Maximum request timeout', value: 60, unit: 'minutes', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/run/docs/configuring/request-timeout' },
-                { id: 'cloud-sql-cross-region-replica', sourceType: 'provider_behavior', metric: 'Cross-region replication', value: 'asynchronous', unit: 'replication mode', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/sql/docs/postgres/intro-to-cloud-sql-disaster-recovery?hl=en', notes: 'Promotion is intentional; regional failover can have non-zero RPO.' },
-                { id: 'memorystore-standard-ha', sourceType: 'provider_behavior', metric: 'Memorystore Standard Tier', value: 99.9, unit: '% availability SLA', sourceDate: '2026-08-27', sourceUrl: 'https://docs.cloud.google.com/memorystore/docs/redis/memorystore-for-redis-overview', notes: 'Cross-zone replication and automatic failover; up to five read replicas when enabled.' },
-              ],
-        publicListPriceEstimate: { gbpMonth: stateFor(getState()).sim.costGbpMonth, sourceDate: '2026-08-27', assumptions: ['Curated estimate', 'Synthetic replica mix'] },
-        storeVersion: getState().version,
-      }),
+      execute: () => {
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        return liveRead('get_constraints', {}, constraintsPayload(architecture, state));
+      },
+    },
+    {
+      name: 'get_bench_snapshot',
+      description: 'Atomically read scenario, topology, metrics, constraints, RCA, version, tick, and timestamp from one simulation tick.',
+      inputSchema: toolInputSchema({}),
+      execute: () => {
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        return liveRead('get_bench_snapshot', {}, snapshotPayload(architecture, state));
+      },
+    },
+    {
+      name: 'preview_change',
+      description: 'Read-only projection of a mutation. Does not increment storeVersion. Use to ask what happens if traffic or scaling changes.',
+      inputSchema: toolInputSchema({
+        op: { type: 'string' },
+        args: { type: 'object' },
+      }, ['op']),
+      execute: (input) => invoke('preview_change', { op: String(input.op), args: (input.args as Record<string, unknown> | undefined) ?? {} }),
+    },
+    {
+      name: 'apply_remediation_plan',
+      description: 'Apply several legal mutations as one all-or-nothing transaction with a single expectedVersion and one version bump.',
+      inputSchema: toolInputSchema({
+        steps: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 8,
+          items: {
+            type: 'object',
+            properties: { op: { type: 'string' }, args: { type: 'object' } },
+            required: ['op'],
+            additionalProperties: false,
+          },
+        },
+        expectedVersion: { type: 'number' },
+      }, ['steps', 'expectedVersion']),
+      execute: (input) => invoke('apply_remediation_plan', { steps: input.steps }, Number(input.expectedVersion)),
     },
     {
       name: 'set_peak_rps',
@@ -880,6 +1136,12 @@ function makeTools(
       description: 'Start the deterministic stress or failure path for the loaded reference.',
       inputSchema: toolInputSchema({ expectedVersion: { type: 'number' } }, ['expectedVersion']),
       execute: (input) => invoke('run_stress_test', { trafficMultiplier: 1 }, Number(input.expectedVersion)),
+    },
+    {
+      name: 'fail_component',
+      description: 'Fail a runtime component as a hard outage. Distinct from set_fault_profile dropout, which is packet loss.',
+      inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
+      execute: (input) => invoke('fail_component', { id: String(input.id) }, Number(input.expectedVersion)),
     },
     {
       name: 'restore_component',
@@ -921,12 +1183,7 @@ function makeTools(
 
   if (architecture.id === 'event_driven_checkout') {
     tools.push(
-      {
-        name: 'set_autoscaling',
-        description: 'Change a declared service replica count within the loaded reference.',
-        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
-        execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
-      },
+      autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max.', invoke),
       {
         name: 'set_ordering_key_parallelism',
         description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.',
@@ -968,12 +1225,8 @@ function makeTools(
         inputSchema: toolInputSchema({ primaryPercent: { type: 'number' }, expectedVersion: { type: 'number' } }, ['primaryPercent', 'expectedVersion']),
         execute: (input) => invoke('set_region_traffic_split', { primaryPercent: Number(input.primaryPercent) }, Number(input.expectedVersion)),
       },
-      {
-        name: 'set_autoscaling',
-        description: 'Scale a surviving regional Cloud Run service within the reference.',
-        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
-        execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
-      },
+      latencyRoutingTool('Enable or disable latency-based routing on the global external Application Load Balancer. Traffic shifts toward the faster healthy region.', invoke),
+      autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max.', invoke),
     );
   }
 
@@ -981,16 +1234,12 @@ function makeTools(
     tools.push(
       {
         name: 'set_model_traffic_split',
-        description: 'Set the release-candidate share of model traffic.',
+        description: 'Set the release-candidate share of model traffic. The healthy default is a 20% canary.',
         inputSchema: toolInputSchema({ newModelPercent: { type: 'number' }, expectedVersion: { type: 'number' } }, ['newModelPercent', 'expectedVersion']),
         execute: (input) => invoke('set_model_traffic_split', { newModelPercent: Number(input.newModelPercent) }, Number(input.expectedVersion)),
       },
-      {
-        name: 'set_autoscaling',
-        description: 'Scale one of the Vertex AI serving endpoints within the reference.',
-        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), min: { type: 'number' }, max: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'min', 'max', 'expectedVersion']),
-        execute: (input) => invoke('set_autoscaling', { id: String(input.id), min: Number(input.min), max: Number(input.max) }, Number(input.expectedVersion)),
-      },
+      latencyRoutingTool('Enable or disable latency-based routing on the model router. A slower or failed release candidate sheds traffic back to the stable endpoint.', invoke),
+      autoscalingTool(architecture, 'Set Vertex AI or Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max.', invoke),
       {
         name: 'set_batching',
         description: 'Configure deterministic Vertex AI batching and wait time.',
@@ -1002,24 +1251,16 @@ function makeTools(
   return annotateTools(tools);
 }
 
-function stateFor(state: State) {
-  return state;
-}
-
-function runCommandFor(
-  current: State,
+function applyDomainOp(
+  state: State,
   architecture: ArchitectureDefinition,
-  source: Source,
   op: string,
   args: Record<string, unknown>,
-  expectedVersion?: number,
-): { state: State; result: DomainResult } {
-  const command: CommandFn = (state) => {
+): { state: State; result: Partial<DomainResult> } {
     if (op === 'run_stress_test') {
       if (state.running) return { state, result: { ok: false, code: 'ALREADY_RUNNING', currentVersion: state.version } };
       const next = { ...state, running: true, stressActive: true };
       if (architecture.id === 'multi_region_saas' && state.failedRegions.length === 0) next.failedRegions = ['us-east4'];
-      if (architecture.id === 'llm_inference_serving') next.modelNewPercent = Math.max(next.modelNewPercent, 80);
       return { state: applyMetrics(next, architecture), result: {} };
     }
     if (op === 'stop_stress_test') return { state: { ...state, running: false }, result: {} };
@@ -1085,7 +1326,7 @@ function runCommandFor(
     if (op === 'clear_all_faults') {
       return { state: applyMetrics({ ...state, faults: {} }, architecture), result: { cleared: Object.keys(state.faults).length } };
     }
-    if (op === 'kill_component') {
+    if (op === 'fail_component' || op === 'kill_component') {
       const id = String(args.id);
       if (!architecture.nodes.some((node) => node.id === id)) return { state, result: { ok: false, code: 'UNKNOWN_NODE', message: `Unknown node ${id}.` } };
       return { state: applyMetrics({ ...state, killedNodes: Array.from(new Set([...state.killedNodes, id])), running: true, stressActive: true }, architecture), result: { id } };
@@ -1115,16 +1356,82 @@ function runCommandFor(
       const id = String(args.id);
       const node = architecture.nodes.find((item) => item.id === id);
       if (!node) return { state, result: { ok: false, code: 'UNKNOWN_NODE', message: `Unknown node ${id}.` } };
-      const min = Math.max(1, Math.round(Number(args.min)));
-      const max = Math.max(min, Math.round(Number(args.max)));
-      const replicas = Math.min(max, Math.max(min, state.replicaOverrides[id] ?? node.replicas));
-      const next = applyMetrics({ ...state, replicaOverrides: { ...state.replicaOverrides, [id]: replicas } }, architecture);
+      const enabled = args.enabled !== false;
+      const min = Math.max(1, Math.min(32, Math.round(Number(args.min ?? state.autoscaling[id]?.min ?? node.replicas))));
+      const max = Math.max(min, Math.min(32, Math.round(Number(args.max ?? state.autoscaling[id]?.max ?? Math.max(node.replicas, 8)))));
+      const targetUtilPercent = Math.min(90, Math.max(10, Math.round(Number(args.targetUtilPercent ?? state.autoscaling[id]?.targetUtilPercent ?? 70))));
+      const autoscaling = { ...state.autoscaling };
+      if (enabled) autoscaling[id] = { min, max, targetUtilPercent };
+      else delete autoscaling[id];
+      const replicaOverrides = enabled
+        ? state.replicaOverrides
+        : { ...state.replicaOverrides, [id]: Math.min(max, Math.max(min, state.replicaOverrides[id] ?? node.replicas)) };
+      const next = applyMetrics({ ...state, autoscaling, replicaOverrides }, architecture);
       if (state.pins.includes('budget_hard') && next.sim.costGbpMonth > state.budget) return { state, result: { ok: false, code: 'PINNED_BUDGET', message: 'This change exceeds the human budget limit.' } };
-      return { state: next, result: { id, min, max, replicas } };
+      return { state: next, result: { id, enabled, min, max, targetUtilPercent, replicas: next.replicaOverrides[id] } };
+    }
+    if (op === 'set_latency_based_routing') {
+      if (architecture.id === 'event_driven_checkout') {
+        return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'Latency-based routing is only available on split-path references.' } };
+      }
+      const enabled = Boolean(args.enabled);
+      return { state: applyMetrics({ ...state, latencyBasedRouting: enabled }, architecture), result: { enabled } };
     }
     return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: `Unknown command ${op}.` } };
-  };
-  return mutate(current, source, op, args, command, expectedVersion);
+}
+
+function runCommandFor(
+  current: State,
+  architecture: ArchitectureDefinition,
+  source: Source,
+  op: string,
+  args: Record<string, unknown>,
+  expectedVersion?: number,
+): { state: State; result: DomainResult } {
+  if (op === 'preview_change') {
+    const nestedOp = String(args.op ?? '');
+    const nestedArgs = (args.args as Record<string, unknown> | undefined) ?? {};
+    if (!nestedOp || READ_ONLY_TOOLS.has(nestedOp) || nestedOp === 'apply_remediation_plan' || nestedOp === 'preview_change') {
+      return readResult(current, source, 'preview_change', args, {
+        applied: false,
+        code: 'PREVIEW_NOT_A_MUTATION',
+        message: `${nestedOp || 'op'} cannot be previewed.`,
+        storeVersion: current.version,
+      });
+    }
+    const outcome = applyDomainOp(current, architecture, nestedOp, nestedArgs);
+    if (outcome.result.ok === false) {
+      return readResult(current, source, 'preview_change', args, {
+        applied: false,
+        rejection: outcome.result,
+        storeVersion: current.version,
+      });
+    }
+    const projected = { ...outcome.state, version: current.version };
+    const beforeRca = rootCauseFor(architecture, current);
+    const afterRca = rootCauseFor(architecture, projected);
+    return readResult(current, source, 'preview_change', args, {
+      applied: true,
+      storeVersion: current.version,
+      before: snapshotPayload(architecture, current),
+      after: snapshotPayload(architecture, projected),
+      delta: { ...previewDelta(current, projected), rcaStatus: { before: beforeRca.status, after: afterRca.status } },
+    });
+  }
+  if (op === 'apply_remediation_plan') {
+    const parsed = parseRemediationSteps(args.steps);
+    if (!parsed.ok) {
+      return mutate(current, source, op, args, (state) => ({ state, result: { ok: false, code: parsed.code, message: parsed.message } }), expectedVersion);
+    }
+    return mutate(current, source, op, args, (state) => {
+      const planned = applyPlanSteps(state, parsed.steps, (working, stepOp, stepArgs) => applyDomainOp(working, architecture, stepOp, stepArgs));
+      if (!planned.ok) {
+        return { state, result: { ok: false, code: planned.code, message: planned.message, failedIndex: planned.failedIndex, failedOp: planned.failedOp } };
+      }
+      return { state: planned.state, result: { stepsApplied: planned.stepResults.length, stepResults: planned.stepResults } };
+    }, expectedVersion);
+  }
+  return mutate(current, source, op, args, (state) => applyDomainOp(state, architecture, op, args), expectedVersion);
 }
 
 function TopologyThumbnail({ architecture }: { architecture: ArchitectureDefinition }) {
@@ -1169,9 +1476,14 @@ function BrandMark() {
   return <span className="brand-mark" aria-hidden="true"><span /><span /><span /></span>;
 }
 
-function SiteToolsLamp({ status, count = 0 }: { status: 'off' | 'green' | 'amber' | 'red'; count?: number }) {
-  const label = status === 'green' ? `${count} tools registered` : status === 'amber' ? 'WebMCP unavailable' : status === 'red' ? 'WebMCP registration error' : 'SITE TOOLS off on Catalogue';
-  return <span className={`site-tools-lamp ${status}`} title={label}><span className="lamp-dot" aria-hidden="true" /> <span>SITE TOOLS</span><b>{status === 'off' ? 'OFF' : status === 'green' ? 'LIVE' : status.toUpperCase()}</b></span>;
+function SiteToolsLamp({ status, count = 0 }: { status: 'off' | 'green' | 'amber' | 'red' | 'registering'; count?: number }) {
+  const label = status === 'green' ? `${count} tools registered`
+    : status === 'registering' ? `WebMCP registering ${count} tools`
+      : status === 'amber' ? 'WebMCP unavailable'
+        : status === 'red' ? 'WebMCP registration error'
+          : 'SITE TOOLS off on Catalogue';
+  const mark = status === 'off' ? 'OFF' : status === 'green' ? 'LIVE' : status === 'registering' ? 'REGISTERING' : status.toUpperCase();
+  return <span className={`site-tools-lamp ${status}`} title={label}><span className="lamp-dot" aria-hidden="true" /> <span>SITE TOOLS</span><b>{mark}</b></span>;
 }
 
 function CatalogueView() {
@@ -1221,10 +1533,6 @@ function CatalogueView() {
   );
 }
 
-function healthLabel(health: Health) {
-  return health === 'healthy' ? 'OK' : health === 'degraded' ? 'WARN' : 'DOWN';
-}
-
 function zoneShortLabel(zone: ZoneId) {
   return zone.endsWith('-a') ? 'AZ A' : 'AZ B';
 }
@@ -1234,11 +1542,11 @@ function edgeState(edge: EdgeDefinition, state: State) {
 }
 
 function signalColor(health: Health) {
-  return health === 'down' ? 0xe35b63 : health === 'degraded' ? 0xff8b24 : 0x63d5e5;
+  return isOutage(health) ? 0xe35b63 : health === 'degraded' ? 0xff8b24 : 0x63d5e5;
 }
 
 function signalOpacity(health: Health) {
-  return health === 'down' ? 0.12 : health === 'degraded' ? 0.72 : 0.38;
+  return isOutage(health) ? 0.12 : health === 'degraded' ? 0.72 : 0.38;
 }
 
 function createSignalTexture() {
@@ -1345,14 +1653,15 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
         entry.glowMaterial.color.setHex(color);
         entry.lineMaterial.opacity = signalOpacity(health);
         const failurePulse = reducedMotion ? 1 : 0.72 + (Math.sin(elapsed * 6 + entry.index) + 1) * 0.22;
-        entry.glowMaterial.opacity = health === 'down' ? 0.08 * failurePulse : health === 'degraded' ? 0.34 * failurePulse : 0.08;
+        entry.glowMaterial.opacity = isOutage(health) ? 0.08 * failurePulse : health === 'degraded' ? 0.34 * failurePulse : 0.08;
+        const share = Math.min(1, (nextState.edgeMetrics[entry.edge.id]?.rps ?? 0) / Math.max(nextState.peakRps, 1));
         entry.packets.forEach((packet, packetIndex) => {
           packet.material.color.setHex(color);
           packet.glowMaterial.color.setHex(color);
-          packet.mesh.visible = health !== 'down' && !reducedMotion;
+          packet.mesh.visible = !isOutage(health) && share > 0.005 && (packetIndex === 0 || share >= 0.35) && !reducedMotion;
           packet.glow.visible = packet.mesh.visible;
           if (packet.mesh.visible) {
-            const speed = health === 'degraded' ? 0.32 : 0.14;
+            const speed = (health === 'degraded' ? 0.2 : 0.08) + share * 0.18;
             const progress = (elapsed * speed + packetIndex * 0.29 + entry.index * 0.07) % 1;
             packet.mesh.position.copy(entry.curve.getPoint(progress));
             packet.glow.position.copy(packet.mesh.position);
@@ -1366,7 +1675,7 @@ function TopologySignalField({ architecture, state }: { architecture: Architectu
       anchors.forEach(({ node, anchor, material }, index) => {
         const health = nextState.nodeMetrics[node.id]?.effectiveHealth ?? 'healthy';
         material.color.setHex(signalColor(health));
-        material.opacity = health === 'down' ? 0.48 : health === 'degraded' ? 0.72 : 0.3;
+        material.opacity = isOutage(health) ? 0.48 : health === 'degraded' ? 0.72 : 0.3;
         const pulse = reducedMotion ? 1 : health === 'healthy' ? 1 + Math.sin(elapsed * 1.6 + index * 0.7) * 0.16 : 1.25 + Math.sin(elapsed * 5.4 + index * 0.7) * 0.38;
         anchor.scale.setScalar(pulse);
       });
@@ -1487,11 +1796,11 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
             <strong>{node.name}</strong>
             {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
             {state.faults[node.id] ? <span className="fault-mark">FAULT · +{state.faults[node.id].latencyMs} ms · {state.faults[node.id].dropoutPercent}% drop</span> : null}
-            <span className="node-stats"><span>{metric ? `${formatNumber(metric.utilisation * 100, 0)}%` : '--'} util</span><span>{healthLabel(health)}</span></span>
+            <span className="node-stats"><span title={`${formatNumber(metric.demandRps)} req/s demand · ${formatNumber((metric.utilisation ?? 0) * 100, 0)}% util`}>{metric ? `${formatNumber(metric.trafficShare * 100, 0)}%` : '--'} flow</span><span>{healthLabel(health)}</span></span>
           </button>
         );
       })}
-      <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />failure propagation</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />down / excluded</span></div>
+      <div className="graph-legend"><span><i className="legend-swatch sparse" />healthy flow</span><span><i className="legend-swatch dense" />failure propagation</span><span><i className="legend-swatch signal" />live signal field</span><span><i className="legend-swatch down" />failed / unreachable</span></div>
       </div>
       </div>
       {selectedNode && <NodeInspector architecture={architecture} node={selectedNode} metric={state.nodeMetrics[selectedNode.id]} state={state} invoke={invoke} onClose={() => onSelectNode('')} />}
@@ -1502,15 +1811,27 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
 function NodeInspector({ architecture, node, metric, state, invoke, onClose }: { architecture: ArchitectureDefinition; node: NodeDefinition; metric?: NodeMetric; state: State; invoke: (op: string, args: Record<string, unknown>) => DomainResult; onClose: () => void }) {
   const resource = gcpResourceProfile(architecture, node);
   const fault = state.faults[node.id];
+  const autoscaling = state.autoscaling[node.id];
+  const canAutoscale = node.legalRemediations.includes('set_autoscaling');
   return (
     <aside className="node-inspector" aria-label={`${node.name} inspector`}>
       <div className="inspector-head"><div><span className="eyebrow">NODE INSPECTOR</span><h3>{node.name}</h3></div><button className="icon-button" onClick={onClose} aria-label="Close inspector"><span className="close-mark" aria-hidden="true" /></button></div>
-      <dl><div><dt>GCP product</dt><dd>{resource.product}</dd></div><div><dt>Service plane</dt><dd>{resource.plane}</dd></div><div><dt>Scope</dt><dd>{resource.scope}</dd></div><div><dt>Replica spread</dt><dd>{metric?.replicaZones.length ? metric.replicaZones.map(zoneShortLabel).join(' · ') : 'provider managed'}</dd></div><div><dt>Replicas available</dt><dd>{metric ? `${metric.availableReplicas} / ${metric.provisionedReplicas}` : state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
+      <dl><div><dt>GCP product</dt><dd>{resource.product}</dd></div><div><dt>Service plane</dt><dd>{resource.plane}</dd></div><div><dt>Scope</dt><dd>{resource.scope}</dd></div><div><dt>Replica spread</dt><dd>{metric?.replicaZones.length ? metric.replicaZones.map(zoneShortLabel).join(' · ') : 'provider managed'}</dd></div><div><dt>Replicas available</dt><dd>{metric ? `${metric.availableReplicas} / ${metric.provisionedReplicas}` : state.replicaOverrides[node.id] ?? node.replicas}</dd></div><div><dt>Health</dt><dd>{metric?.effectiveHealth ? healthLabel(metric.effectiveHealth) : 'OK'}</dd></div><div><dt>Traffic share</dt><dd>{metric ? `${formatNumber(metric.trafficShare * 100, 0)}% · ${formatNumber(metric.demandRps)} req/s` : '--'}</dd></div><div><dt>Demand / served</dt><dd>{metric ? `${formatNumber(metric.demandRps)} / ${formatNumber(metric.servedRps)} req/s` : '--'}</dd></div><div><dt>Utilisation</dt><dd>{metric ? `${formatNumber(metric.utilisation * 100, 0)}%` : '--'}</dd></div><div><dt>Capacity / headroom</dt><dd>{metric ? `${formatNumber(metric.capacity)} / ${formatNumber(Math.max(0, metric.capacity - metric.demandRps))}` : '--'}</dd></div></dl>
       {metric?.queueDepth !== undefined && <p className="inspector-note">Queue depth <b>{formatNumber(metric.queueDepth)}</b> · overflow <b>{formatNumber(metric.overflowRps ?? 0)} req/s</b></p>}
       {metric?.ttftMs !== undefined && <p className="inspector-note">TTFT <b>{formatNumber(metric.ttftMs)} ms</b> · model assumption</p>}
       {metric?.capacityModel && <div className="capacity-equation" aria-label="Capacity model"><span>Capacity model</span><code>{state.replicaOverrides[node.id] ?? node.replicas} replicas × {metric.capacityModel.concurrency} concurrent × 1,000/{metric.capacityModel.serviceTimeMs} ms × {formatNumber(metric.capacityModel.schedulingEfficiency * 100)}% scheduler × {formatNumber(metric.capacityModel.batchGain, 2)} batch</code><small>{formatNumber(metric.capacityModel.reserveRps)} req/s operational reserve shown separately from available headroom.</small></div>}
-      <div className={`fault-readout ${fault ? 'active' : ''}`}><span>Injected fault profile</span><code>{fault ? `+${fault.latencyMs} ms latency · ${fault.dropoutPercent}% dropout` : 'none'}</code><small>WebMCP target: {node.id}</small></div>
+      {canAutoscale && (
+        <div className="autoscale-readout">
+          <span>Autoscaling</span>
+          <code>{autoscaling ? `${autoscaling.min}–${autoscaling.max} replicas @ ${autoscaling.targetUtilPercent}% target` : 'manual replica count'}</code>
+          <button onClick={() => invoke('set_autoscaling', { id: node.id, min: autoscaling?.min ?? 1, max: autoscaling?.max ?? 8, targetUtilPercent: autoscaling?.targetUtilPercent ?? 70, enabled: !autoscaling })}>{autoscaling ? 'Disable autoscaling' : 'Enable autoscaling 1–8'}</button>
+          <small>WebMCP: set_autoscaling</small>
+        </div>
+      )}
+      <div className={`fault-readout ${fault ? 'active' : ''}`}><span>Injected fault profile</span><code>{fault ? `+${fault.latencyMs} ms latency · ${fault.dropoutPercent}% dropout` : 'none'}</code><small>Packet loss / delay. Distinct from fail_component. WebMCP target: {node.id}</small></div>
       <div className="fault-presets" aria-label="Fault injection presets"><button onClick={() => invoke('set_fault_profile', { targetId: node.id, latencyMs: 200, dropoutPercent: fault?.dropoutPercent ?? 0 })}>Inject +200 ms</button><button onClick={() => invoke('set_fault_profile', { targetId: node.id, latencyMs: fault?.latencyMs ?? 0, dropoutPercent: 5 })}>Inject 5% drop</button><button disabled={!fault} onClick={() => invoke('clear_fault_profile', { targetId: node.id })}>Clear fault</button></div>
+      <div className={`fault-readout ${state.killedNodes.includes(node.id) ? 'active' : ''}`}><span>Component outage</span><code>{state.killedNodes.includes(node.id) ? 'failed via fail_component' : 'in service'}</code><small>Hard down. Traffic assigned to this node is not served.</small></div>
+      <div className="fault-presets outage-presets" aria-label="Component outage controls"><button onClick={() => invoke('fail_component', { id: node.id })} disabled={state.killedNodes.includes(node.id)}>Fail component</button><button onClick={() => invoke('restore_component', { id: node.id })} disabled={!state.killedNodes.includes(node.id)}>Restore component</button></div>
       <p className="inspector-source">limits / model assumption / 2026-08-27</p>
     </aside>
   );
@@ -1532,17 +1853,20 @@ function RangeControl({ label, value, min, max, step, suffix, onChange }: { labe
   return <label className="range-control"><span className="range-label"><span>{label}</span><b>{formatNumber(value)}{suffix}</b></span><input type="range" value={value} min={min} max={max} step={step} onChange={(event) => onChange(Number(event.target.value))} /></label>;
 }
 
-function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { architecture: ArchitectureDefinition; state: State; toolStatus: 'off' | 'green' | 'amber' | 'red'; toolCount: number; invoke: (op: string, args: Record<string, unknown>) => DomainResult }) {
+function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { architecture: ArchitectureDefinition; state: State; toolStatus: 'off' | 'green' | 'amber' | 'red' | 'registering'; toolCount: number; invoke: (op: string, args: Record<string, unknown>) => DomainResult }) {
   const stressLabel = architecture.id === 'event_driven_checkout' ? 'Run Pub/Sub stress' : architecture.id === 'multi_region_saas' ? 'Fail us-east4' : 'Ramp Vertex AI endpoint';
+  const rcShare = Math.round((state.nodeMetrics.vertex_rc?.trafficShare ?? state.modelNewPercent / 100) * 100);
+  const europeShare = Math.round((state.nodeMetrics.app_europe?.trafficShare ?? state.regionPrimaryPercent / 100) * 100);
   const scenarioMetric = architecture.id === 'event_driven_checkout'
     ? { label: 'Ordering-key pressure', value: `${formatNumber(state.nodeMetrics.pubsub_ordered?.queueDepth ?? 0)} depth`, note: `${formatNumber(state.nodeMetrics.pubsub_ordered?.capacity ?? 0)} events/s model` }
     : architecture.id === 'multi_region_saas'
-      ? { label: 'Traffic split', value: `${state.regionPrimaryPercent} / ${100 - state.regionPrimaryPercent}`, note: 'primary / secondary' }
-      : { label: 'Release endpoint', value: `${formatNumber((state.nodeMetrics.vertex_rc?.utilisation ?? 0) * 100, 0)}% util`, note: `${formatNumber(state.nodeMetrics.vertex_rc?.ttftMs ?? 350)} ms TTFT` };
+      ? { label: 'Traffic split', value: `${europeShare} / ${100 - europeShare}`, note: state.latencyBasedRouting ? 'primary / secondary · latency routed' : 'primary / secondary' }
+      : { label: 'Model split', value: `${100 - rcShare} / ${rcShare}`, note: state.latencyBasedRouting ? 'stable / rc · latency routed' : 'stable / release candidate' };
   const pins: PinId[] = architecture.id === 'event_driven_checkout' ? ['keep_pubsub_ordering', 'budget_hard'] : architecture.id === 'multi_region_saas' ? ['no_second_region', 'budget_hard'] : ['keep_old_model', 'budget_hard'];
   const availabilityZones = zonesForArchitecture(architecture);
   const activeFaults = Object.entries(state.faults);
   const rca = rootCauseFor(architecture, state);
+  const splitRouting = architecture.id === 'multi_region_saas' || architecture.id === 'llm_inference_serving';
   return (
     <aside className="scenario-rail">
       <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
@@ -1551,6 +1875,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
         <RangeControl label="Monthly budget" value={state.budget} min={3000} max={22000} step={100} suffix=" GBP" onChange={(value) => invoke('set_budget', { budget: value })} />
         {architecture.id === 'multi_region_saas' && <RangeControl label="Primary traffic allocation" value={state.regionPrimaryPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_region_traffic_split', { primaryPercent: value })} />}
         {architecture.id === 'llm_inference_serving' && <RangeControl label="New model traffic" value={state.modelNewPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_model_traffic_split', { newModelPercent: value })} />}
+        {splitRouting && <button className={`pin-stamp policy-stamp ${state.latencyBasedRouting ? 'active' : ''}`} onClick={() => invoke('set_latency_based_routing', { enabled: !state.latencyBasedRouting })}><span className="pin-hole" />Latency-based routing<span className="pin-state">{state.latencyBasedRouting ? 'ON' : 'OFF'}</span></button>}
       </section>
       <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><p>Fail one zone to remove only the replicas placed there. Surviving replicas keep serving at reduced capacity.</p><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
       <section className="rail-section rail-faults"><div className="section-title"><span>Fault injection</span><span className={activeFaults.length ? 'readout-status bad' : 'pin-count'}>{activeFaults.length} active</span></div><p>WebMCP can target any component or connection with latency and request dropout. Effects are traffic-weighted and recorded in the FDR.</p>{activeFaults.length ? <div className="fault-list">{activeFaults.map(([targetId, fault]) => <div key={targetId}><code>{targetId}</code><span>+{formatNumber(fault.latencyMs)} ms · {formatNumber(fault.dropoutPercent, 2)}% drop</span></div>)}<button onClick={() => invoke('clear_all_faults', {})}>Clear all injected faults</button></div> : <div className="fault-empty"><span>NO ACTIVE FAULTS</span><small>Tools: set_fault_profile · clear_fault_profile</small></div>}</section>
@@ -1558,7 +1883,7 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
       <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
       <section className={`rail-section rail-rca rca-${rca.status}`}><div className="section-title"><span>Root cause analysis</span><span className={`readout-status ${rca.status === 'healthy' ? 'good' : 'bad'}`}>{rca.status}</span></div><p>{rca.summary}</p>{rca.primaryCause && <div className="rca-primary"><span>PRIMARY / {Math.round(rca.primaryCause.confidence * 100)}% CONFIDENCE</span><code>{rca.primaryCause.targetId}</code><small>Ask WebMCP: get_root_cause_analysis</small></div>}</section>
       <section className="rail-section rail-reference"><div className="section-title"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a></div><p>{architecture.referenceSpec}</p></section>
-      <section className="rail-section rail-tools"><div className="section-title"><span>Tool surface</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div><p>{toolStatus === 'green' ? `${toolCount} architecture-specific tools registered.` : toolStatus === 'amber' ? 'Browser tools unavailable. The bench remains fully runnable.' : toolStatus === 'red' ? 'Registration needs attention.' : 'Registering on Bench.'}</p><div className="tool-note"><span className="tool-rail-mark" />same store / same version / same truth</div></section>
+      <section className="rail-section rail-tools"><div className="section-title"><span>Tool surface</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div><p>{toolStatus === 'green' ? `${toolCount} architecture-specific tools registered.` : toolStatus === 'registering' ? `Registering ${toolCount} tools atomically. Wait for toolsReady before invoking the full set.` : toolStatus === 'amber' ? 'Browser tools unavailable. The bench remains fully runnable. html[data-webmcp-capability]=unsupported.' : toolStatus === 'red' ? 'Registration needs attention.' : 'Registering on Bench.'}</p><div className="tool-note"><span className="tool-rail-mark" />same store / same version / same truth</div></section>
       <section className="rail-section provenance"><span>Model boundary</span><p>Simulation values are inspectable model assumptions. Pricing is a public list-price estimate, not a bill.</p><small>Snapshot / 2026-08-27</small></section>
     </aside>
   );
@@ -1574,6 +1899,7 @@ declare global {
     resilienceForge?: {
       invoke: (op: string, args: Record<string, unknown>, expectedVersion?: number) => DomainResult;
       getState: () => State;
+      webmcp?: ReturnType<typeof getWebMcpStatus>;
     };
   }
 }
@@ -1583,8 +1909,8 @@ function BenchView({ architectureId }: { architectureId: string }) {
   const [state, setState] = useState<State>(() => createInitialState(architecture, loadSavedControls(architecture.id)));
   const stateRef = useRef(state);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const [toolStatus, setToolStatus] = useState<'off' | 'green' | 'amber' | 'red'>('amber');
-  const [toolCount, setToolCount] = useState(0);
+  const [toolStatus, setToolStatus] = useState<'off' | 'green' | 'amber' | 'red' | 'registering'>('registering');
+  const [toolCount, setToolCount] = useState(() => makeTools(architecture).length);
   const commit = useCallback((next: State) => {
     stateRef.current = next;
     setState(next);
@@ -1606,21 +1932,24 @@ function BenchView({ architectureId }: { architectureId: string }) {
   useEffect(() => {
     try {
       localStorage.setItem('resilience-forge:last-reference', architecture.id);
-      localStorage.setItem(`resilience-forge:controls:${architecture.id}`, JSON.stringify({ peakRps: state.peakRps, budget: state.budget, regionPrimaryPercent: state.regionPrimaryPercent, modelNewPercent: state.modelNewPercent, pins: state.pins }));
+      localStorage.setItem(`resilience-forge:controls:${architecture.id}`, JSON.stringify({ peakRps: state.peakRps, budget: state.budget, regionPrimaryPercent: state.regionPrimaryPercent, modelNewPercent: state.modelNewPercent, pins: state.pins, latencyBasedRouting: state.latencyBasedRouting, autoscaling: state.autoscaling }));
     } catch {
       // Local persistence is a convenience only.
     }
-  }, [architecture.id, state.budget, state.modelNewPercent, state.peakRps, state.pins, state.regionPrimaryPercent]);
+  }, [architecture.id, state.autoscaling, state.budget, state.latencyBasedRouting, state.modelNewPercent, state.peakRps, state.pins, state.regionPrimaryPercent]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    bindLiveBench({
+      getState: () => stateRef.current,
+      invoke: (op, args, expectedVersion) => invoke(op, args, expectedVersion, 'webmcp'),
+      read: (op, args, payload) => read(op, args, payload),
+    });
     window.resilienceForge = {
       invoke: (op, args, expectedVersion) => invoke(op, args, expectedVersion, 'webmcp'),
       getState: () => stateRef.current,
+      webmcp: getWebMcpStatus(),
     };
-    return () => {
-      delete window.resilienceForge;
-    };
-  }, [invoke]);
+  });
 
   useEffect(() => {
     if (!state.running) return;
@@ -1635,15 +1964,12 @@ function BenchView({ architectureId }: { architectureId: string }) {
   }, [architecture, commit, state.running]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    const tools = makeTools(
-      architecture,
-      () => stateRef.current,
-      (op, args, expectedVersion) => invoke(op, args, expectedVersion, 'webmcp'),
-      read,
-    );
-    registerWebMcpTools(tools, controller.signal)
+    const tools = makeTools(architecture);
+    let cancelled = false;
+    detectCapability();
+    ensureWebMcpRegistration(architecture.id, tools)
       .then((result) => {
+        if (cancelled) return;
         if (result.supported) {
           setToolStatus('green');
           setToolCount(result.count);
@@ -1652,9 +1978,14 @@ function BenchView({ architectureId }: { architectureId: string }) {
           setToolCount(0);
         }
       })
-      .catch(() => setToolStatus('red'));
-    return () => controller.abort();
-  }, [architecture, invoke, read]);
+      .catch(() => {
+        if (!cancelled) setToolStatus('red');
+      });
+    return () => {
+      cancelled = true;
+      scheduleWebMcpRelease(architecture.id);
+    };
+  }, [architecture]);
 
   const selectedNode = useMemo(() => architecture.nodes.find((node) => node.id === selectedNodeId), [architecture.nodes, selectedNodeId]);
   return (

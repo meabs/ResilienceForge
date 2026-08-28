@@ -8,8 +8,8 @@ test('zonal failure removes only replicas placed in that availability zone', () 
   assert.equal(replicaHealth(3, 1), 'degraded');
 });
 
-test('service is down only when no placed replica survives', () => {
+test('service is failed only when no placed replica survives', () => {
   const placements = ['europe-west2-a', 'europe-west2-b'];
   assert.equal(availableReplicaCount(placements, ['europe-west2-a', 'europe-west2-b']), 0);
-  assert.equal(replicaHealth(2, 0), 'down');
+  assert.equal(replicaHealth(2, 0), 'failed');
 });
