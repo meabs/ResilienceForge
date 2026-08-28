@@ -4,7 +4,6 @@ export const NESTED_OR_READ_OPS = new Set([
   'apply_remediation_plan',
   'preview_change',
   'get_webmcp_status',
-  'get_capability',
   'get_bench_guide',
   'get_architecture',
   'get_scenario',
@@ -12,6 +11,7 @@ export const NESTED_OR_READ_OPS = new Set([
   'get_root_cause_analysis',
   'get_constraints',
   'get_bench_snapshot',
+  'get_decision_log',
 ]);
 
 export interface PlanStep {

@@ -22,9 +22,12 @@ Environment: standard browser automation (no WebMCP runtime). WebMCP tool regist
 1. Open the live URL in ChatGPT desktop in-app browser.
 2. Load any reference from Catalogue manually.
 3. Confirm SITE TOOLS is **green** and `get_webmcp_status.toolsReady` is true. Tool count matches `expectedToolCount` for the loaded architecture.
-4. Ask the agent to call `get_bench_guide`, then `get_architecture` and `get_live_metrics`.
+4. Ask the agent to call `get_bench_guide`, then `get_bench_snapshot`.
 5. Run `run_stress_test`, attempt remediation, then change peak load or traffic split while the agent works.
-6. Verify stale mutation returns `STALE_STATE` and FDR shows both `ui` and `webmcp` sources.
+6. Verify stale mutation returns `STALE_STATE`, FDR flashes, `get_decision_log` shows the human `ui` event, and a retry with the new `expectedVersion` succeeds.
+7. Pin Keep Pub/Sub ordering and confirm `unordered: true` returns `PINNED_KEEP_PUBSUB_ORDERING`.
+
+Capture `docs/site-tools-green.png` from this ChatGPT session before Devpost submit.
 
 ## Screenshot
 

@@ -43,3 +43,20 @@ test('catalog wait can finish from a toolchange-style subscription without waiti
   const result = await pending;
   assert.equal(result.matched, true);
 });
+
+test('aborted execute returns ABORTED without calling the tool', async () => {
+  const { wrapToolExecute } = await import('./webmcp.ts');
+  let called = false;
+  const execute = wrapToolExecute(() => {
+    called = true;
+    return { ok: true, code: 'OK' };
+  });
+  const controller = new AbortController();
+  controller.abort();
+  const result = await execute({}, { signal: controller.signal }) as { code: string };
+  assert.equal(result.code, 'ABORTED');
+  assert.equal(called, false);
+  const ok = await execute({ peakRps: 1 }) as { code: string };
+  assert.equal(ok.code, 'OK');
+  assert.equal(called, true);
+});

@@ -26,7 +26,9 @@ import {
 } from './data';
 import { availableReplicaCount, replicaHealth, replicaPlacements } from './availability';
 import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './faults';
-import { bindLiveBench, detectCapability, ensureWebMcpRegistration, getWebMcpStatus, liveBench, releaseWebMcpRegistration, watchModelContext, type ToolRegistration } from './webmcp';
+import { bindLiveBench, detectCapability, ensureWebMcpRegistration, getWebMcpStatus, liveBench, releaseWebMcpRegistration, watchModelContext, wrapToolExecute, type ToolRegistration } from './webmcp';
+import { isUnorderedPubSubAttempt, pinRejection } from './pins';
+import { formatFdrCopy, isRejectedCode, visibleFdrEntries } from './fdr';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
@@ -130,6 +132,7 @@ interface State {
   sim: SimResult;
   log: FdrEntry[];
   lastMutation?: { source: Source; op: string; tick: number; targetId?: string };
+  lastRejection?: { code: string; op: string; tick: number };
 }
 
 interface DomainResult {
@@ -435,7 +438,9 @@ function applyMetrics(state: State, architecture: ArchitectureDefinition): State
     const fault = state.faults[node.id] ?? { latencyMs: 0, dropoutPercent: 0 };
 
     if (architecture.id === 'event_driven_checkout' && node.id === 'pubsub_ordered') {
-      capacity = Math.min(300 * state.orderingKeyShards * state.pubsubBatch, 45000);
+      capacity = state.orderingKeyShards < 1
+        ? Math.min(12000 * Math.max(state.pubsubBatch, 1), 120000)
+        : Math.min(300 * state.orderingKeyShards * state.pubsubBatch, 45000);
       if (state.stressActive) {
         served = Math.min(demand, capacity);
         overflowRps = Math.max(0, demand - served);
@@ -634,12 +639,14 @@ function mutate(
       resultCode: 'STALE_STATE',
     });
     return {
-      state: { ...current, log },
+      state: { ...current, log, lastRejection: { code: 'STALE_STATE', op, tick: current.tick } },
       result: {
         ok: false,
         code: 'STALE_STATE',
         expectedVersion,
         currentVersion: current.version,
+        read: ['get_decision_log', 'get_bench_snapshot'],
+        message: 'Human or simulation moved the store. Re-read get_decision_log then retry with the new expectedVersion.',
       },
     };
   }
@@ -654,7 +661,7 @@ function mutate(
       resultCode: String(outcome.result.code ?? 'REJECTED'),
     });
     return {
-      state: { ...current, log },
+      state: { ...current, log, lastRejection: { code: String(outcome.result.code ?? 'REJECTED'), op, tick: current.tick } },
       result: {
         ok: false,
         code: String(outcome.result.code ?? 'REJECTED'),
@@ -667,6 +674,7 @@ function mutate(
   const nextState = {
     ...outcome.state,
     version: nextVersion,
+    lastRejection: undefined,
     lastMutation: { source, op, tick: current.tick, targetId: typeof args.targetId === 'string' ? args.targetId : typeof args.id === 'string' ? args.id : typeof args.zone === 'string' ? args.zone : typeof args.region === 'string' ? args.region : undefined },
     log: appendLog(outcome.state, {
       source,
@@ -679,7 +687,25 @@ function mutate(
   };
   return {
     state: nextState,
-    result: { ok: true, code: 'OK', currentVersion: nextVersion, ...outcome.result },
+    result: {
+      ok: true,
+      code: 'OK',
+      currentVersion: nextVersion,
+      before: simSnapshot(current),
+      after: simSnapshot(nextState),
+      ...outcome.result,
+    },
+  };
+}
+
+function simSnapshot(state: State) {
+  return {
+    availability: state.sim.availability,
+    p95Ms: state.sim.p95Ms,
+    errorRate: state.sim.errorRate,
+    rpsAchieved: state.sim.rpsAchieved,
+    costGbpMonth: state.sim.costGbpMonth,
+    sloPass: state.sim.sloPass,
   };
 }
 
@@ -723,7 +749,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
       'Agent waits for get_webmcp_status.toolsReady or data-webmcp-ready=true, then reads get_bench_snapshot.',
       'Agent begins legal remediation with expectedVersion from that snapshot, or apply_remediation_plan for compound steps.',
       'Human may change ordinary controls at any time while the agent is operating.',
-      'Stale agent mutations return STALE_STATE; agent re-reads and adapts.',
+      'Stale agent mutations return STALE_STATE; agent calls get_decision_log, re-reads, and adapts.',
       'fail_component is a hard outage. 100% dropout is unreachable packet loss, not a failed component.',
       'preview_change is read-only and does not increment storeVersion.',
       'reset_scenario restores the loaded reference baseline and is what updates the visible failed overlay. stop_stress_test only ends the run; it is not a reset.',
@@ -749,7 +775,7 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
         'set_ordering_key_parallelism to spread ordering keys',
         'set_batching with higher maxBatch within model limits',
         'set_autoscaling on Cloud Run services — replacement replicas land in surviving zones',
-        'add_read_replica for zonal failure path',
+        'add_read_replica for zonal failure path — same-region replica stays legal under no_second_region',
       ],
       stressTool: 'run_stress_test',
     };
@@ -788,7 +814,6 @@ function benchGuideFor(architecture: ArchitectureDefinition) {
 
 const READ_ONLY_TOOLS = new Set([
   'get_webmcp_status',
-  'get_capability',
   'get_bench_guide',
   'get_architecture',
   'get_scenario',
@@ -796,13 +821,74 @@ const READ_ONLY_TOOLS = new Set([
   'get_root_cause_analysis',
   'get_constraints',
   'get_bench_snapshot',
+  'get_decision_log',
   'preview_change',
 ]);
+
+const DESTRUCTIVE_TOOLS = new Set([
+  'fail_component',
+  'fail_zone',
+  'fail_region',
+  'reset_scenario',
+  'clear_all_faults',
+]);
+
+const IDEMPOTENT_TOOLS = new Set([
+  'restore_component',
+  'restore_zone',
+  'restore_region',
+  'clear_fault_profile',
+  'clear_all_faults',
+  'stop_stress_test',
+  'add_read_replica',
+]);
+
+const TOOL_TITLES: Record<string, string> = {
+  get_webmcp_status: 'WebMCP status',
+  get_bench_guide: 'Bench guide',
+  get_architecture: 'Architecture',
+  get_scenario: 'Scenario',
+  get_live_metrics: 'Live metrics',
+  get_root_cause_analysis: 'Root cause',
+  get_constraints: 'Constraints',
+  get_bench_snapshot: 'Bench snapshot',
+  get_decision_log: 'Decision log',
+  preview_change: 'Preview change',
+  apply_remediation_plan: 'Apply remediation plan',
+  set_peak_rps: 'Set peak load',
+  set_budget: 'Set budget',
+  run_stress_test: 'Run stress test',
+  stop_stress_test: 'Stop stress test',
+  reset_scenario: 'Reset scenario',
+  fail_component: 'Fail component',
+  restore_component: 'Restore component',
+  fail_zone: 'Fail zone',
+  restore_zone: 'Restore zone',
+  set_fault_profile: 'Set fault profile',
+  clear_fault_profile: 'Clear fault profile',
+  clear_all_faults: 'Clear all faults',
+  set_autoscaling: 'Set autoscaling',
+  set_ordering_key_parallelism: 'Set ordering-key parallelism',
+  set_batching: 'Set batching',
+  add_read_replica: 'Add read replica',
+  fail_region: 'Fail region',
+  restore_region: 'Restore region',
+  set_region_traffic_split: 'Set region traffic split',
+  set_latency_based_routing: 'Set latency-based routing',
+  set_model_traffic_split: 'Set model traffic split',
+};
 
 function annotateTools(tools: ToolRegistration[]): ToolRegistration[] {
   return tools.map((tool) => ({
     ...tool,
-    annotations: { readOnlyHint: READ_ONLY_TOOLS.has(tool.name) },
+    title: TOOL_TITLES[tool.name] ?? tool.name.replaceAll('_', ' '),
+    annotations: {
+      readOnlyHint: READ_ONLY_TOOLS.has(tool.name),
+      destructiveHint: DESTRUCTIVE_TOOLS.has(tool.name),
+      idempotentHint: IDEMPOTENT_TOOLS.has(tool.name) || READ_ONLY_TOOLS.has(tool.name),
+      ...(tool.name === 'get_root_cause_analysis' ? { untrustedContentHint: true } : {}),
+    },
+    execute: wrapToolExecute(tool.execute),
   }));
 }
 
@@ -1027,15 +1113,6 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
       },
     },
     {
-      name: 'get_capability',
-      description: 'Alias of get_webmcp_status. Use html[data-webmcp-capability] and html[data-webmcp-ready] for a pre-discovery signal.',
-      inputSchema: toolInputSchema({}),
-      execute: () => {
-        const status = getWebMcpStatus();
-        return liveRead('get_capability', {}, { ...status, toolsReady: status.ready });
-      },
-    },
-    {
       name: 'get_bench_guide',
       description: 'Read the signature human-agent loop, valid remediation paths, pin semantics, and error codes for this bench.',
       inputSchema: toolInputSchema({}),
@@ -1102,6 +1179,22 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
         const state = liveState();
         if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
         return liveRead('get_bench_snapshot', {}, snapshotPayload(architecture, state));
+      },
+    },
+    {
+      name: 'get_decision_log',
+      description: 'Read the Flight Data Recorder: recent ui, webmcp, and sim operator events with versions and result codes. Use after STALE_STATE to see why the store version moved. Does not increment storeVersion.',
+      inputSchema: toolInputSchema({}),
+      execute: () => {
+        const state = liveState();
+        if (!state) return { ok: false, code: 'WEBMCP_NOT_BOUND', currentVersion: 0 };
+        const entries = visibleFdrEntries(state.log);
+        return liveRead('get_decision_log', {}, {
+          entries,
+          lines: formatFdrCopy(entries),
+          storeVersion: state.version,
+          tick: state.tick,
+        });
       },
     },
     {
@@ -1211,9 +1304,18 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
       autoscalingTool(architecture, 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max. When a zone is failed, replacement replicas are placed in surviving zones of the same region.', invoke),
       {
         name: 'set_ordering_key_parallelism',
-        description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.',
-        inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), orderingKeyShards: { type: 'number' }, expectedVersion: { type: 'number' } }, ['id', 'orderingKeyShards', 'expectedVersion']),
-        execute: (input) => invoke('set_ordering_key_parallelism', { id: String(input.id), orderingKeyShards: Number(input.orderingKeyShards) }, Number(input.expectedVersion)),
+        description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering. orderingKeyShards below 1 or unordered=true requests unordered replacement, which keep_pubsub_ordering rejects.',
+        inputSchema: toolInputSchema({
+          id: nodeIdProperty(architecture),
+          orderingKeyShards: { type: 'number', minimum: 0, maximum: 15 },
+          unordered: { type: 'boolean' },
+          expectedVersion: { type: 'number' },
+        }, ['id', 'expectedVersion']),
+        execute: (input) => invoke('set_ordering_key_parallelism', {
+          id: String(input.id),
+          orderingKeyShards: input.orderingKeyShards === undefined ? undefined : Number(input.orderingKeyShards),
+          unordered: input.unordered === undefined ? undefined : Boolean(input.unordered),
+        }, Number(input.expectedVersion)),
       },
       {
         name: 'set_batching',
@@ -1223,7 +1325,7 @@ function makeTools(architecture: ArchitectureDefinition): ToolRegistration[] {
       },
       {
         name: 'add_read_replica',
-        description: 'Add a same-region Cloud SQL read replica for the zonal failure path.',
+        description: 'Add a same-region Cloud SQL read replica for the zonal failure path. Legal even when no_second_region is pinned.',
         inputSchema: toolInputSchema({ id: nodeIdProperty(architecture), expectedVersion: { type: 'number' } }, ['id', 'expectedVersion']),
         execute: (input) => invoke('add_read_replica', { id: String(input.id) }, Number(input.expectedVersion)),
       },
@@ -1319,13 +1421,15 @@ function applyDomainOp(
       return { state: applyMetrics({ ...state, budget }, architecture), result: { budgetGbp: budget } };
     }
     if (op === 'set_region_traffic_split') {
-      if (state.pins.includes('no_second_region') && Number(args.primaryPercent) < 100) return { state, result: { ok: false, code: 'PINNED_NO_SECOND_REGION', message: 'Secondary region is excluded by a pinned human constraint.' } };
+      const pinned = pinRejection(state.pins, op, args);
+      if (pinned) return { state, result: pinned };
       const regionPrimaryPercent = Math.min(100, Math.max(0, Math.round(Number(args.primaryPercent))));
       return { state: applyMetrics({ ...state, regionPrimaryPercent }, architecture), result: { primaryPercent: regionPrimaryPercent } };
     }
     if (op === 'set_model_traffic_split') {
       const modelNewPercent = Math.min(100, Math.max(0, Math.round(Number(args.newModelPercent))));
-      if (state.pins.includes('keep_old_model') && modelNewPercent >= 100) return { state, result: { ok: false, code: 'PINNED_KEEP_OLD_MODEL', message: 'The old model must retain non-zero traffic.' } };
+      const pinned = pinRejection(state.pins, op, { ...args, newModelPercent: modelNewPercent });
+      if (pinned) return { state, result: pinned };
       return { state: applyMetrics({ ...state, modelNewPercent }, architecture), result: { newModelPercent: modelNewPercent } };
     }
     if (op === 'set_pin') {
@@ -1338,7 +1442,8 @@ function applyDomainOp(
     }
     if (op === 'fail_region') {
       const region = args.region as Region;
-      if (state.pins.includes('no_second_region') && region === 'us-east4') return { state, result: { ok: false, code: 'PINNED_NO_SECOND_REGION', message: 'Secondary region is already excluded by a pinned human constraint.' } };
+      const pinned = pinRejection(state.pins, op, args);
+      if (pinned) return { state, result: pinned };
       return { state: applyMetrics({ ...state, failedRegions: Array.from(new Set([...state.failedRegions, region])), running: true, stressActive: true }, architecture), result: { region } };
     }
     if (op === 'restore_region') {
@@ -1384,8 +1489,13 @@ function applyDomainOp(
     if (op === 'set_ordering_key_parallelism') {
       const id = String(args.id);
       if (id !== 'pubsub_ordered') return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'Ordering-key parallelism is only legal for the ordered Pub/Sub subscription.' } };
+      const pinned = pinRejection(state.pins, op, args);
+      if (pinned) return { state, result: pinned };
+      if (isUnorderedPubSubAttempt(args)) {
+        return { state: applyMetrics({ ...state, orderingKeyShards: 0 }, architecture), result: { orderingKeyShards: 0, ordered: false } };
+      }
       const orderingKeyShards = Math.min(15, Math.max(1, Math.round(Number(args.orderingKeyShards))));
-      return { state: applyMetrics({ ...state, orderingKeyShards }, architecture), result: { orderingKeyShards } };
+      return { state: applyMetrics({ ...state, orderingKeyShards }, architecture), result: { orderingKeyShards, ordered: true } };
     }
     if (op === 'set_batching') {
       const id = String(args.id);
@@ -1395,8 +1505,12 @@ function applyDomainOp(
       return { state: applyMetrics({ ...state, pubsubBatch: id === 'pubsub_ordered' ? maxBatch : state.pubsubBatch, batching: { ...state.batching, [id]: { maxBatch, waitMs } } }, architecture), result: { id, maxBatch, waitMs } };
     }
     if (op === 'add_read_replica') {
-      if (state.pins.includes('no_second_region')) return { state, result: {} };
-      return { state: applyMetrics({ ...state, readReplicaAdded: true }, architecture), result: { id: args.id } };
+      const id = String(args.id ?? 'cloud_sql');
+      const node = architecture.nodes.find((item) => item.id === id);
+      if (!node || !node.legalRemediations.includes('add_read_replica')) {
+        return { state, result: { ok: false, code: 'ILLEGAL_MOVE', message: 'A same-region read replica is only legal for Cloud SQL on this reference.' } };
+      }
+      return { state: applyMetrics({ ...state, readReplicaAdded: true }, architecture), result: { id, sameRegion: true, region: node.region } };
     }
     if (op === 'set_autoscaling') {
       const id = String(args.id);
@@ -1529,7 +1643,7 @@ function SiteToolsLamp({ status, count = 0 }: { status: 'off' | 'green' | 'amber
         : status === 'red' ? 'WebMCP registration error'
           : 'SITE TOOLS off on Catalogue';
   const mark = status === 'off' ? 'OFF' : status === 'green' ? 'LIVE' : status === 'registering' ? 'REGISTERING' : status.toUpperCase();
-  return <span className={`site-tools-lamp ${status}`} title={label}><span className="lamp-dot" aria-hidden="true" /> <span>SITE TOOLS</span><b>{mark}</b></span>;
+  return <span className={`site-tools-lamp ${status}`} title={label} aria-label={`SITE TOOLS ${mark}. ${label}`}><span className="lamp-dot" aria-hidden="true" /> <span>SITE TOOLS</span><b>{mark}</b></span>;
 }
 
 function CatalogueView() {
@@ -1547,7 +1661,7 @@ function CatalogueView() {
         <div className="hero-copy">
           <p className="eyebrow">CATALOGUE / GCP REFERENCES / ONE LIVE TRUTH</p>
           <h1>Pick a reference.<br /><span>Stress the truth.</span></h1>
-          <p className="hero-description">Choose a known architecture, load it onto the bench, and make its trade-offs visible before implementation. A browser agent can operate the tools once you decide what the system is allowed to be.</p>
+          <p className="hero-description">Load a known architecture onto the bench and make its trade-offs visible before implementation.</p>
         </div>
         <div className="thesis-rail" aria-label="Product thesis">
           <span className="rail-mark" />
@@ -1566,10 +1680,9 @@ function CatalogueView() {
               <h2>{architecture.name}</h2>
               <p className="card-job">{architecture.job}</p>
               <dl className="reference-facts">
-                <div><dt>Operating shape</dt><dd>{architecture.operatingShape}</dd></div>
-                <div><dt>GCP specification</dt><dd><a className="reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">{architecture.referenceSpec}<span aria-hidden="true">↗</span></a></dd></div>
-                <div><dt>Distinctive failure</dt><dd>{architecture.failure}</dd></div>
-                <div><dt>Human interrupt</dt><dd>{architecture.interrupt}</dd></div>
+                <div><dt>Failure</dt><dd>{architecture.failure}</dd></div>
+                <div><dt>Interrupt</dt><dd>{architecture.interrupt}</dd></div>
+                <div><dt>GCP spec</dt><dd><a className="reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">{architecture.operatingShape}<span aria-hidden="true">↗</span></a></dd></div>
               </dl>
               <a className="load-button" href={`/bench/${architecture.id}`}><span>Load onto bench</span><span className="button-mark" aria-hidden="true" /></a>
             </div>
@@ -1845,7 +1958,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
             <strong>{node.name}</strong>
             {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
             {state.faults[node.id] ? <span className="fault-mark">FAULT · +{state.faults[node.id].latencyMs} ms · {state.faults[node.id].dropoutPercent}% drop</span> : null}
-            <span className="node-stats"><span title={`${formatNumber(metric.demandRps)} req/s demand · ${formatNumber((metric.utilisation ?? 0) * 100, 0)}% util`}>{metric ? `${formatNumber(metric.trafficShare * 100, 0)}%` : '--'} flow</span><span>{healthLabel(health)}</span></span>
+            <span className="node-stats"><span title={`${formatNumber(metric?.demandRps ?? 0)} req/s demand · ${formatNumber((metric?.trafficShare ?? 0) * 100, 0)}% traffic share`}>{metric ? `${formatNumber(metric.utilisation * 100, 0)}%` : '--'} util</span><span>{healthLabel(health)}</span></span>
           </button>
         );
       })}
@@ -1918,8 +2031,10 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
   const splitRouting = architecture.id === 'multi_region_saas' || architecture.id === 'llm_inference_serving';
   return (
     <aside className="scenario-rail">
-      <section className="rail-section rail-heading"><div><p className="eyebrow">SCENARIO / {architecture.scenarioLabel}</p><h2>{architecture.name}</h2></div><span className="shared-state-mark">v{state.version}</span></section>
-      <section className="rail-section rail-live"><div className="section-title"><span>Live controls</span><span className="human-chip">HUMAN / OPEN</span></div>      <p>These controls stay usable while SITE TOOLS is operating.</p><button className={`stress-button ${state.running ? 'running' : ''}`} onClick={() => state.running ? invoke('stop_stress_test', {}) : invoke('run_stress_test', { trafficMultiplier: 1 })}>{state.running ? 'Stop stress test' : stressLabel}<span className="button-mark" aria-hidden="true" /></button>
+      <section className="rail-section rail-live">
+        <div className="section-title"><span>Live controls</span><span className="human-chip">HUMAN / OPEN</span></div>
+        <div className="rail-heading-row"><h2>Scenario</h2><span className="shared-state-mark">v{state.version}</span></div>
+        <button className={`stress-button ${state.running ? 'running' : ''}`} onClick={() => state.running ? invoke('stop_stress_test', {}) : invoke('run_stress_test', { trafficMultiplier: 1 })}>{state.running ? 'Stop stress test' : stressLabel}<span className="button-mark" aria-hidden="true" /></button>
         <button className="pin-stamp policy-stamp" onClick={() => invoke('reset_scenario', {})}><span className="pin-hole" />Reset scenario<span className="pin-state">BASELINE</span></button>
         <RangeControl label="Peak load" value={state.peakRps} min={architecture.id === 'llm_inference_serving' ? 60 : 1000} max={architecture.id === 'event_driven_checkout' ? 18000 : architecture.id === 'multi_region_saas' ? 9000 : 500} step={architecture.id === 'event_driven_checkout' ? 500 : architecture.id === 'llm_inference_serving' ? 10 : 50} suffix=" req/s" onChange={(value) => invoke('set_peak_rps', { peakRps: value })} />
         <RangeControl label="Monthly budget" value={state.budget} min={3000} max={22000} step={100} suffix=" GBP" onChange={(value) => invoke('set_budget', { budget: value })} />
@@ -1927,21 +2042,80 @@ function ScenarioRail({ architecture, state, toolStatus, toolCount, invoke }: { 
         {architecture.id === 'llm_inference_serving' && <RangeControl label="New model traffic" value={state.modelNewPercent} min={0} max={100} step={5} suffix="%" onChange={(value) => invoke('set_model_traffic_split', { newModelPercent: value })} />}
         {splitRouting && <button className={`pin-stamp policy-stamp ${state.latencyBasedRouting ? 'active' : ''}`} onClick={() => invoke('set_latency_based_routing', { enabled: !state.latencyBasedRouting })}><span className="pin-hole" />Latency-based routing<span className="pin-state">{state.latencyBasedRouting ? 'ON' : 'OFF'}</span></button>}
       </section>
-      <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><p>Fail one zone to remove only the replicas placed there. Surviving replicas keep serving at reduced capacity. Autoscaled services reschedule into remaining zones.</p><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
-      <section className="rail-section rail-faults"><div className="section-title"><span>Fault injection</span><span className={activeFaults.length ? 'readout-status bad' : 'pin-count'}>{activeFaults.length} active</span></div><p>WebMCP can target any component or connection with latency and request dropout. Effects are traffic-weighted and recorded in the FDR.</p>{activeFaults.length ? <div className="fault-list">{activeFaults.map(([targetId, fault]) => <div key={targetId}><code>{targetId}</code><span>+{formatNumber(fault.latencyMs)} ms · {formatNumber(fault.dropoutPercent, 2)}% drop</span></div>)}<button onClick={() => invoke('clear_all_faults', {})}>Clear all injected faults</button></div> : <div className="fault-empty"><span>NO ACTIVE FAULTS</span><small>Tools: set_fault_profile · clear_fault_profile</small></div>}</section>
-      <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><p>Constraints are domain invariants. The graph stays visible when a region or model is excluded.</p><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
-      <section className="rail-section rail-readout"><div className="section-title"><span>Bench readout</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div><div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div><div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div></section>
-      <section className={`rail-section rail-rca rca-${rca.status}`}><div className="section-title"><span>Root cause analysis</span><span className={`readout-status ${rca.status === 'healthy' ? 'good' : 'bad'}`}>{rca.status}</span></div><p>{rca.summary}</p>{rca.primaryCause && <div className="rca-primary"><span>PRIMARY / {Math.round(rca.primaryCause.confidence * 100)}% CONFIDENCE</span><code>{rca.primaryCause.targetId}</code><small>Ask WebMCP: get_root_cause_analysis</small></div>}</section>
-      <section className="rail-section rail-reference"><div className="section-title"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a></div><p>{architecture.referenceSpec}</p></section>
-      <section className="rail-section rail-tools"><div className="section-title"><span>Tool surface</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div><p>{toolStatus === 'green' ? `${toolCount} architecture-specific tools registered.` : toolStatus === 'registering' ? `Registering ${toolCount} tools atomically. Wait for toolsReady before invoking the full set.` : toolStatus === 'amber' ? 'Browser tools unavailable. The bench remains fully runnable. html[data-webmcp-capability]=unsupported.' : toolStatus === 'red' ? 'Registration needs attention.' : 'Registering on Bench.'}</p><div className="tool-note"><span className="tool-rail-mark" />same store / same version / same truth</div></section>
-      <section className="rail-section provenance"><span>Model boundary</span><p>Simulation values are inspectable model assumptions. Pricing is a public list-price estimate, not a bill.</p><small>Snapshot / 2026-08-27</small></section>
+      <section className="rail-section rail-pins"><div className="section-title"><span>Human pins</span><span className="pin-count">{state.pins.length} active</span></div><div className="pin-list">{pins.map((pin) => <button key={pin} className={`pin-stamp ${state.pins.includes(pin) ? 'active' : ''}`} onClick={() => invoke('set_pin', { pin, enabled: !state.pins.includes(pin) })}><span className="pin-hole" />{pinLabel(pin)}<span className="pin-state">{state.pins.includes(pin) ? 'ON' : 'OFF'}</span></button>)}</div></section>
+      <section className={`rail-section rail-rca rca-${rca.status}`}>
+        <div className="section-title"><span>Root cause</span><span className={`readout-status ${state.sim.sloPass ? 'good' : state.stressActive ? 'bad' : 'neutral'}`}>{state.sim.sloPass ? 'SLO PASS' : state.stressActive ? 'SLO FAIL' : 'NOT TESTED'}</span></div>
+        <div className="scenario-readout"><span>{scenarioMetric.label}</span><strong>{scenarioMetric.value}</strong><small>{scenarioMetric.note}</small></div>
+        <div className="breach-list">{state.sim.breachReasons.map((reason) => <span key={reason}>{reason}</span>)}</div>
+        <p>{rca.summary}</p>
+        {rca.primaryCause && <div className="rca-primary"><span>PRIMARY / {Math.round(rca.primaryCause.confidence * 100)}% CONFIDENCE</span><code>{rca.primaryCause.targetId}</code></div>}
+      </section>
+      <section className="rail-section rail-zones"><div className="section-title"><span>Availability zones</span><span className="pin-count">{state.failedZones.length} failed</span></div><div className="zone-controls">{availabilityZones.map((zone) => { const failed = state.failedZones.includes(zone); return <button key={zone} className={failed ? 'failed' : ''} onClick={() => invoke(failed ? 'restore_zone' : 'fail_zone', { zone })}><span><b>{zoneShortLabel(zone)}</b><small>{zone}</small></span><strong>{failed ? 'RESTORE' : 'FAIL ZONE'}</strong></button>; })}</div></section>
+      <section className="rail-section rail-faults"><div className="section-title"><span>Fault injection</span><span className={activeFaults.length ? 'readout-status bad' : 'pin-count'}>{activeFaults.length} active</span></div>{activeFaults.length ? <div className="fault-list">{activeFaults.map(([targetId, fault]) => <div key={targetId}><code>{targetId}</code><span>+{formatNumber(fault.latencyMs)} ms · {formatNumber(fault.dropoutPercent, 2)}% drop</span></div>)}<button onClick={() => invoke('clear_all_faults', {})}>Clear all injected faults</button></div> : <div className="fault-empty"><span>NO ACTIVE FAULTS</span><small>Select a node to inject latency or dropout.</small></div>}</section>
+      <details className="rail-notes">
+        <summary>Reference and tools</summary>
+        <div className="rail-notes-body">
+          <div className="rail-notes-block"><span>GCP reference</span><a className="reference-link rail-reference-link" href={architecture.referenceUrl} target="_blank" rel="noreferrer">Official spec ↗</a><p>{architecture.referenceSpec}</p></div>
+          <div className="rail-notes-block"><span>Tool surface</span><SiteToolsLamp status={toolStatus} count={toolCount} /><p>{toolStatus === 'green' ? `${toolCount} architecture-specific tools registered.` : toolStatus === 'registering' ? `Registering ${toolCount} tools.` : toolStatus === 'amber' ? 'Browser tools unavailable. The bench remains fully runnable.' : toolStatus === 'red' ? 'Registration needs attention.' : 'Registering on Bench.'}</p></div>
+          <div className="rail-notes-block"><span>Model boundary</span><p>Simulation values are inspectable model assumptions. Pricing is a public list-price estimate, not a bill. One bench, two operators, no silent overwrite.</p><small>Snapshot / 2026-08-27</small></div>
+        </div>
+      </details>
     </aside>
   );
 }
 
 function FdrTicker({ entries }: { entries: FdrEntry[] }) {
-  const visible = entries.slice(-7);
-  return <footer className="fdr-ticker" aria-live="polite"><div className="fdr-label"><span className="fdr-signal" /> <b>FDR</b><small>FLIGHT DATA RECORDER</small></div><div className="fdr-entries">{visible.map((entry, index) => <div className={`fdr-entry ${index === visible.length - 1 ? 'latest' : ''}`} key={`${entry.ts}-${entry.op}-${index}`}><span className={`fdr-source ${sourceClass[entry.source]}`}>{entry.source}</span><span className="fdr-time">{entry.ts}</span><code>{entry.op} {compactArgs(entry.args)}</code><span className="fdr-version">v{entry.beforeVersion}&gt;{entry.afterVersion}</span><b className={`fdr-code code-${entry.resultCode.toLowerCase()}`}>{entry.resultCode}</b></div>)}</div></footer>;
+  const visible = visibleFdrEntries(entries);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [copied, setCopied] = useState(false);
+  const latest = visible.at(-1);
+  const rejected = latest ? isRejectedCode(latest.resultCode) : false;
+
+  useEffect(() => {
+    const node = scrollerRef.current;
+    if (node) node.scrollLeft = node.scrollWidth;
+  }, [visible]);
+
+  const copyLog = async () => {
+    const text = formatFdrCopy(visible);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.left = '-9999px';
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      area.remove();
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  };
+
+  return (
+    <footer className={`fdr-ticker ${rejected ? 'stale-flash' : ''}`} aria-live="polite">
+      <div className="fdr-label">
+        <span className="fdr-signal" />
+        <b>FDR</b>
+        <small>FLIGHT DATA RECORDER</small>
+        <button type="button" className="fdr-copy" onClick={() => { void copyLog(); }}>{copied ? 'Copied' : 'Copy log'}</button>
+      </div>
+      <div className="fdr-entries" ref={scrollerRef}>
+        {visible.map((entry, index) => (
+          <div className={`fdr-entry ${index === visible.length - 1 ? 'latest' : ''} ${isRejectedCode(entry.resultCode) ? 'rejected' : ''}`} key={`${entry.ts}-${entry.op}-${index}`}>
+            <span className={`fdr-source ${sourceClass[entry.source]}`}>{entry.source}</span>
+            <span className="fdr-time">{entry.ts}</span>
+            <code>{entry.op} {compactArgs(entry.args)}</code>
+            <span className="fdr-version">v{entry.beforeVersion}&gt;{entry.afterVersion}</span>
+            <b className={`fdr-code code-${entry.resultCode.toLowerCase()}`}>{entry.resultCode}</b>
+          </div>
+        ))}
+      </div>
+    </footer>
+  );
 }
 
 declare global {
@@ -1954,10 +2128,30 @@ declare global {
   }
 }
 
+function UnknownBench({ requestedId }: { requestedId: string }) {
+  return (
+    <main className="app-shell bench-shell">
+      <header className="topbar bench-topbar"><a href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</a><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>UNKNOWN REFERENCE</small></span></div></header>
+      <div className="unknown-bench">
+        <p className="eyebrow">BENCH / NOT FOUND</p>
+        <h1>Unknown reference</h1>
+        <p>No architecture named <code>{requestedId}</code>. Pick Event-driven checkout, Multi-region SaaS, or LLM inference serving from the catalogue.</p>
+        <a className="load-button" href="/"><span>Back to catalogue</span><span className="button-mark" aria-hidden="true" /></a>
+      </div>
+    </main>
+  );
+}
+
 function BenchView({ architectureId }: { architectureId: string }) {
   const architecture = getArchitecture(architectureId);
-  const [state, setState] = useState<State>(() => createInitialState(architecture, loadSavedControls(architecture.id)));
+  if (!architecture) return <UnknownBench requestedId={architectureId} />;
+  return <LoadedBench architecture={architecture} />;
+}
+
+function LoadedBench({ architecture }: { architecture: ArchitectureDefinition }) {
+  const [state, setState] = useState<State>(() => createInitialState(architecture));
   const stateRef = useRef(state);
+  const [controlsHydrated, setControlsHydrated] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [toolStatus, setToolStatus] = useState<'off' | 'green' | 'amber' | 'red' | 'registering'>('registering');
   const [toolCount, setToolCount] = useState(() => makeTools(architecture).length);
@@ -1979,14 +2173,25 @@ function BenchView({ architectureId }: { architectureId: string }) {
     return outcome.result;
   }, [commit]);
 
+  useLayoutEffect(() => {
+    const saved = loadSavedControls(architecture.id);
+    const restored = saved ? createInitialState(architecture, saved) : null;
+    if (restored) stateRef.current = restored;
+    queueMicrotask(() => {
+      if (restored) setState(restored);
+      setControlsHydrated(true);
+    });
+  }, [architecture]);
+
   useEffect(() => {
+    if (!controlsHydrated) return;
     try {
       localStorage.setItem('resilience-forge:last-reference', architecture.id);
       localStorage.setItem(`resilience-forge:controls:${architecture.id}`, JSON.stringify({ peakRps: state.peakRps, budget: state.budget, regionPrimaryPercent: state.regionPrimaryPercent, modelNewPercent: state.modelNewPercent, pins: state.pins, latencyBasedRouting: state.latencyBasedRouting, autoscaling: state.autoscaling }));
     } catch {
       // Local persistence is a convenience only.
     }
-  }, [architecture.id, state.autoscaling, state.budget, state.latencyBasedRouting, state.modelNewPercent, state.peakRps, state.pins, state.regionPrimaryPercent]);
+  }, [architecture.id, controlsHydrated, state.autoscaling, state.budget, state.latencyBasedRouting, state.modelNewPercent, state.peakRps, state.pins, state.regionPrimaryPercent]);
 
   useLayoutEffect(() => {
     bindLiveBench({
@@ -2005,7 +2210,11 @@ function BenchView({ architectureId }: { architectureId: string }) {
     let cancelled = false;
     const tools = makeTools(architecture);
     const start = () => {
-      detectCapability();
+      const capability = detectCapability();
+      if (capability.capability === 'unsupported') {
+        setToolStatus('amber');
+        setToolCount(0);
+      }
       ensureWebMcpRegistration(architecture.id, tools)
         .then((result) => {
           if (cancelled) return;
@@ -2018,12 +2227,17 @@ function BenchView({ architectureId }: { architectureId: string }) {
           }
         })
         .catch(() => {
-          if (!cancelled) setToolStatus('red');
+          if (!cancelled) setToolStatus('amber');
         });
     };
+    start();
+    const settle = window.setTimeout(() => {
+      setToolStatus((current) => (current === 'registering' ? 'amber' : current));
+    }, 2500);
     const stopWatch = watchModelContext(start);
     return () => {
       cancelled = true;
+      window.clearTimeout(settle);
       stopWatch();
     };
   }, [architecture]);
@@ -2032,20 +2246,19 @@ function BenchView({ architectureId }: { architectureId: string }) {
     if (!state.running) return;
     const timer = window.setInterval(() => {
       const current = stateRef.current;
-      const advanced = applyMetrics({ ...current, tick: current.tick + 1 }, architecture);
-      const shouldLog = advanced.tick % 4 === 0;
-      const next = shouldLog ? { ...advanced, log: appendLog(advanced, { source: 'sim', op: 'tick', args: { tick: advanced.tick }, beforeVersion: advanced.version, afterVersion: advanced.version, resultCode: 'OK' }) } : advanced;
+      const next = applyMetrics({ ...current, tick: current.tick + 1, lastRejection: current.lastRejection }, architecture);
       commit(next);
     }, 500);
     return () => window.clearInterval(timer);
   }, [architecture, commit, state.running]);
 
   const selectedNode = useMemo(() => architecture.nodes.find((node) => node.id === selectedNodeId), [architecture.nodes, selectedNodeId]);
+  const stressLabel = architecture.id === 'event_driven_checkout' ? 'Run Pub/Sub stress' : architecture.id === 'multi_region_saas' ? 'Fail us-east4' : 'Ramp Vertex AI endpoint';
   return (
     <main className="app-shell bench-shell">
       <header className="topbar bench-topbar"><a href="/" className="back-link"><span className="back-mark" aria-hidden="true" />Catalogue</a><div className="bench-title"><BrandMark /><span><b>RESILIENCE FORGE</b><small>{architecture.platform} / {architecture.name.toUpperCase()} / LIVE BENCH</small></span></div><div className="topbar-status"><span className="version-readout">SHARED STATE / v{state.version}</span><SiteToolsLamp status={toolStatus} count={toolCount} /></div></header>
       <div className="bench-layout">
-        <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.platform} / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>{architecture.platform} REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} invoke={invoke} /></div><MetricStrip state={state} architecture={architecture} /><div className="proof-band"><div><strong>One bench. Two operators. No silent overwrite.</strong><p>Change a normal control while tools are active. The version moves, the stale write is rejected, and the next legal move has to read the new state.</p></div><div className="proof-mark"><span className="proof-square" /><span>live controls stay open</span></div></div></section>
+        <section className="bench-canvas-column"><div className="bench-intro"><div><p className="eyebrow">LIVE BENCH / {architecture.platform} / {architecture.scenarioLabel}</p><h1>{architecture.name}</h1><p>{architecture.job}</p></div><div className="bench-stamp"><span>{architecture.platform} REFERENCE</span><strong>{architecture.id}</strong><small>human-loaded / externally operable</small></div></div><div className="bench-operate"><button className={`stress-button ${state.running ? 'running' : ''}`} onClick={() => state.running ? invoke('stop_stress_test', {}) : invoke('run_stress_test', { trafficMultiplier: 1 })}>{state.running ? 'Stop stress test' : stressLabel}<span className="button-mark" aria-hidden="true" /></button></div><div className="canvas-panel"><TopologyCanvas architecture={architecture} state={state} selectedNodeId={selectedNodeId} onSelectNode={(id) => setSelectedNodeId(id || null)} invoke={invoke} /></div><MetricStrip state={state} architecture={architecture} />{state.lastRejection?.code === 'STALE_STATE' ? <div className="stale-banner" role="status"><strong>STALE_STATE</strong><span>Store moved to v{state.version}. Re-read get_decision_log, then retry with the new expectedVersion.</span></div> : null}</section>
         <ScenarioRail architecture={architecture} state={state} toolStatus={toolStatus} toolCount={toolCount} invoke={invoke} />
       </div>
       <FdrTicker entries={state.log} />
@@ -2055,6 +2268,9 @@ function BenchView({ architectureId }: { architectureId: string }) {
 }
 
 export default function ResilienceForge({ view, architectureId }: { view: 'catalogue' | 'bench'; architectureId?: string }) {
+  if (view !== 'bench') return <CatalogueView />;
   const benchId = architectureId ?? 'event_driven_checkout';
-  return view === 'bench' ? <BenchView key={benchId} architectureId={benchId} /> : <CatalogueView />;
+  const architecture = getArchitecture(benchId);
+  if (!architecture) return <UnknownBench requestedId={benchId} />;
+  return <BenchView key={architecture.id} architectureId={architecture.id} />;
 }

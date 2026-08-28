@@ -37,7 +37,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" data-webmcp-capability="unknown" data-webmcp-ready="false">
+    <html lang="en" data-webmcp-capability="unknown" data-webmcp-ready="false" suppressHydrationWarning>
       <body className={`${plexSans.variable} ${plexMono.variable}`}>
         <script
           dangerouslySetInnerHTML={{

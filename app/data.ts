@@ -183,7 +183,7 @@ export const architectures: ArchitectureDefinition[] = [
 ];
 
 export const getArchitecture = (id: string | undefined) =>
-  architectures.find((architecture) => architecture.id === id) ?? architectures[0];
+  architectures.find((architecture) => architecture.id === id);
 
 export const limits = {
   checkoutStandardUnbatched: { id: 'pubsub-ordered-key-standard', sourceType: 'model_assumption', value: 300, unit: 'events/s', sourceDate: '2026-08-27', notes: 'Synthetic GCP ordering-key bench model based on a 3.3 KB event profile.' },

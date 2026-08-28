@@ -5,6 +5,29 @@ Resilience Forge is a shared human-and-browser-agent operations bench for testin
 - **Live project:** [resilience-forge.gman72.chatgpt.site](https://resilience-forge.gman72.chatgpt.site/)
 - **Public source:** [github.com/meabs/ResilienceForge](https://github.com/meabs/ResilienceForge)
 - **License:** [MIT](./LICENSE)
+- **Submission copy:** [docs/DEVPOST.md](./docs/DEVPOST.md)
+- **Demo video script:** [docs/DEMO-VIDEO.md](./docs/DEMO-VIDEO.md)
+
+## Judge prompt
+
+Open the live URL in **ChatGPT desktop’s in-app browser** (SITE TOOLS must be green). Standard Chrome stays amber. Load is human-only — the agent cannot choose the reference.
+
+Paste:
+
+```
+You are on Resilience Forge. Wait until get_webmcp_status.toolsReady is true, or html[data-webmcp-ready]=true.
+
+1. Call get_bench_guide, then get_bench_snapshot.
+2. Run the distinctive stress for this reference.
+3. Start a legal remediation using expectedVersion from the snapshot.
+4. I will change an ordinary live control (peak load, region split, or model split) while you work.
+5. When you get STALE_STATE, call get_decision_log, then get_bench_snapshot, then retry with the new expectedVersion.
+6. Do not violate pinned human constraints. keep_pubsub_ordering blocks unordered Pub/Sub replacement; a same-region add_read_replica stays legal.
+
+Narrate what changed in the graph, gauges, and FDR.
+```
+
+Then change Peak load (or Primary traffic / New model traffic) while the agent is operating. Confirm FDR shows `ui` then `webmcp` `STALE_STATE`, then a successful retry.
 
 The build follows the project documents in this repository:
 
@@ -59,13 +82,14 @@ The production build is emitted by Vinext for the Cloudflare Workers-compatible 
 
 The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). Tools register in `useLayoutEffect` against a page-lifetime AbortSignal: React remounts and tab handoffs do not abort the set. `ready` / `toolsReady` is set only after `registerTool`/`registerTools` finishes **and** `getTools()` lists every expected name (or `toolchange` reports the full catalog). Agents should wait for `html[data-webmcp-ready]=true`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady` before treating the full tool set as live. `html[data-webmcp-capability]` is written on first paint so hosts can see support before discovery.
 
-Each `tool` contains the required `name`, `description`, `inputSchema`, and `execute` fields. Live handlers are rebound across tab remounts so the session can continue without rediscovery when the same architecture is still loaded.
+Each `tool` contains `name`, `title`, `description`, `inputSchema`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`), and `execute`. `execute` honors an AbortSignal as its second argument and returns `ABORTED` if cancelled before it runs. Live handlers are rebound across tab remounts so the session can continue without rediscovery when the same architecture is still loaded.
+
+`get_decision_log` is the agent-readable Flight Data Recorder. After `STALE_STATE`, the agent can see the human `ui` operation that moved the version without scraping the ticker. Mutating tools return `{ before, after }` availability / SLO snapshots. The FDR ticker shows the last 30 operator events, is copyable, and flashes on `STALE_STATE`.
 
 ### Common tools (all architectures)
 
 ```ts
 document.modelContext.registerTool({ name: 'get_webmcp_status', description: 'Read WebMCP capability, toolsReady, session id, and registered tool names.', inputSchema: {}, execute: async (input) => read('get_webmcp_status', input) });
-document.modelContext.registerTool({ name: 'get_capability', description: 'Alias of get_webmcp_status. Use html[data-webmcp-capability] and html[data-webmcp-ready] for a pre-discovery signal.', inputSchema: {}, execute: async (input) => read('get_capability', input) });
 document.modelContext.registerTool({ name: 'get_bench_guide', description: 'Read the signature human-agent loop, valid remediation paths, pin semantics, and error codes for this bench.', inputSchema: {}, execute: async (input) => read('get_bench_guide', input) });
 document.modelContext.registerTool({ name: 'get_architecture', description: 'Read the current semantic topology, health, failures, exclusions, and store version.', inputSchema: {}, execute: async (input) => read('get_architecture', input) });
 document.modelContext.registerTool({ name: 'get_scenario', description: 'Read current human scenario controls, targets, pins, and store version.', inputSchema: {}, execute: async (input) => read('get_scenario', input) });
@@ -73,6 +97,7 @@ document.modelContext.registerTool({ name: 'get_live_metrics', description: 'Rea
 document.modelContext.registerTool({ name: 'get_root_cause_analysis', description: 'Explain the current failure and return recovery actions with expected effect, prerequisites, trade-offs, and recovery kind.', inputSchema: {}, execute: async (input) => read('get_root_cause_analysis', input) });
 document.modelContext.registerTool({ name: 'get_constraints', description: 'Read applicable provider-limit and model-assumption records with source dates and provenance.', inputSchema: {}, execute: async (input) => read('get_constraints', input) });
 document.modelContext.registerTool({ name: 'get_bench_snapshot', description: 'Atomically read scenario, topology, metrics, constraints, RCA, version, tick, and timestamp from one simulation tick.', inputSchema: {}, execute: async (input) => read('get_bench_snapshot', input) });
+document.modelContext.registerTool({ name: 'get_decision_log', description: 'Read Flight Data Recorder entries (ui / webmcp / sim) with versions and result codes. Use after STALE_STATE.', inputSchema: {}, execute: async (input) => read('get_decision_log', input) });
 document.modelContext.registerTool({ name: 'preview_change', description: 'Read-only projection of a mutation. Does not increment storeVersion.', inputSchema: { op: { type: 'string' }, args: { type: 'object' } }, execute: async (input) => read('preview_change', input) });
 document.modelContext.registerTool({ name: 'apply_remediation_plan', description: 'Apply several legal mutations as one all-or-nothing transaction with a single expectedVersion and one version bump.', inputSchema: { steps: { type: 'array' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('apply_remediation_plan', input) });
 document.modelContext.registerTool({ name: 'set_peak_rps', description: 'Set peak load demand in requests per second for the current scenario.', inputSchema: { peakRps: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_peak_rps', input) });
@@ -95,9 +120,9 @@ document.modelContext.registerTool({ name: 'clear_all_faults', description: 'Cle
 
 ```ts
 document.modelContext.registerTool({ name: 'set_autoscaling', description: 'Set Cloud Run autoscaling bounds. Replicas follow demand toward the target utilisation within min/max. When a zone is failed, replacement replicas are placed in surviving zones of the same region.', inputSchema: { id: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' }, targetUtilPercent: { type: 'number' }, enabled: { type: 'boolean' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_autoscaling', input) });
-document.modelContext.registerTool({ name: 'set_ordering_key_parallelism', description: 'Set the number of Pub/Sub ordering keys used to spread ordered work while retaining per-key ordering.', inputSchema: { id: { type: 'string' }, orderingKeyShards: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_ordering_key_parallelism', input) });
+document.modelContext.registerTool({ name: 'set_ordering_key_parallelism', description: 'Set Pub/Sub ordering-key parallelism. unordered=true or orderingKeyShards<1 is unordered replacement and is rejected when keep_pubsub_ordering is pinned.', inputSchema: { id: { type: 'string' }, orderingKeyShards: { type: 'number' }, unordered: { type: 'boolean' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_ordering_key_parallelism', input) });
 document.modelContext.registerTool({ name: 'set_batching', description: 'Configure Pub/Sub batching within the declared GCP model limits.', inputSchema: { id: { type: 'string' }, maxBatch: { type: 'number' }, waitMs: { type: 'number' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('set_batching', input) });
-document.modelContext.registerTool({ name: 'add_read_replica', description: 'Add a same-region Cloud SQL read replica for the zonal failure path.', inputSchema: { id: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('add_read_replica', input) });
+document.modelContext.registerTool({ name: 'add_read_replica', description: 'Add a same-region Cloud SQL read replica. Legal even when no_second_region is pinned.', inputSchema: { id: { type: 'string' }, expectedVersion: { type: 'number' } }, execute: async (input) => mutate('add_read_replica', input) });
 ```
 
 ### Multi-region SaaS tools

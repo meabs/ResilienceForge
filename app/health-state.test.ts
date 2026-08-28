@@ -26,6 +26,23 @@ test('fail_component topology health stays failed even with dropout', () => {
   }), 'failed');
 });
 
+test('projected overload is visible before a stress run', () => {
+  assert.equal(classifyEffectiveHealth({
+    topologyHealth: 'healthy',
+    dropoutPercent: 0,
+    latencyMs: 0,
+    utilisation: 1.5,
+    stressActive: false,
+  }), 'degraded');
+  assert.equal(classifyEffectiveHealth({
+    topologyHealth: 'healthy',
+    dropoutPercent: 0,
+    latencyMs: 0,
+    utilisation: 0.4,
+    stressActive: false,
+  }), 'healthy');
+});
+
 test('replacing lost replicas recovers node health during an active stress run', () => {
   assert.equal(classifyEffectiveHealth({
     topologyHealth: 'degraded',

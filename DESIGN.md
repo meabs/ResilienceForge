@@ -10,7 +10,7 @@ colors:
   line-soft: "#2a343e"
   paper: "#e7ecef"
   muted: "#93a1ac"
-  quiet: "#66747f"
+  quiet: "#8d9ba6"
   safety-orange: "#ff8a28"
   acid-yellow: "#d9ef46"
   signal-cyan: "#73c9d2"
@@ -107,7 +107,7 @@ Use graphite and steel as the field. Accents are scarce and semantic: orange mea
 - **Graphite** (`#101419`) and **Graphite 2** (`#151b21`): page field and deep surfaces.
 - **Steel** (`#1d252d`) and **Steel 2** (`#27313b`): panels, node fills, and raised working surfaces.
 - **Paper** (`#e7ecef`): primary text.
-- **Muted** (`#93a1ac`) and **Quiet** (`#66747f`): supporting text and labels.
+- **Muted** (`#93a1ac`) and **Quiet** (`#8d9ba6`): supporting text and labels. AA on steel and graphite.
 - **Line** (`#3b4752`) and **Line Soft** (`#2a343e`): structure, dividers, and panel edges.
 
 ### Named Rules

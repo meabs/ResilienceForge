@@ -8,6 +8,7 @@ test('plan parser rejects empty, oversized, nested, and malformed steps', () => 
   assert.equal(parseRemediationSteps(Array.from({ length: 9 }, () => ({ op: 'set_peak_rps', args: {} }))).ok, false);
   assert.equal(parseRemediationSteps([{ op: 'apply_remediation_plan', args: {} }]).ok, false);
   assert.equal(parseRemediationSteps([{ op: 'get_bench_snapshot' }]).ok, false);
+  assert.equal(parseRemediationSteps([{ op: 'get_decision_log' }]).ok, false);
   assert.equal(parseRemediationSteps([{ op: 'set_peak_rps', args: [] }]).ok, false);
 });
 

@@ -9,7 +9,7 @@ export function classifyEffectiveHealth(input: {
 }): Health {
   if (input.topologyHealth === 'failed') return 'failed';
   if (input.dropoutPercent >= 100) return 'unreachable';
-  if (input.topologyHealth === 'degraded' || input.latencyMs > 0 || input.dropoutPercent > 0 || input.stressActive && input.utilisation > 0.9) {
+  if (input.topologyHealth === 'degraded' || input.latencyMs > 0 || input.dropoutPercent > 0 || input.utilisation > 0.9) {
     return 'degraded';
   }
   return 'healthy';

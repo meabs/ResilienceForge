@@ -1,9 +1,22 @@
+export interface ToolAnnotations {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  untrustedContentHint?: boolean;
+}
+
+export type ToolExecute = (
+  input: Record<string, unknown>,
+  extras?: { signal?: AbortSignal },
+) => Promise<unknown> | unknown;
+
 export interface ToolRegistration {
   name: string;
+  title?: string;
   description: string;
   inputSchema?: Record<string, unknown>;
-  annotations?: { readOnlyHint?: boolean };
-  execute: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+  annotations?: ToolAnnotations;
+  execute: ToolExecute;
 }
 
 interface ModelContext {
@@ -63,6 +76,16 @@ const session: WebMcpStatus & {
   controller: null,
   pending: null,
 };
+
+export function wrapToolExecute(execute: ToolExecute): ToolExecute {
+  return (input, extras) => {
+    if (extras?.signal?.aborted) {
+      const version = (liveBench.getState() as { version?: number } | null)?.version ?? 0;
+      return { ok: false, code: 'ABORTED', currentVersion: version, message: 'Tool execution was cancelled before it ran.' };
+    }
+    return execute(input, extras);
+  };
+}
 
 export function resolveWebMcpRuntime() {
   if (typeof document === 'undefined') return null;
@@ -209,11 +232,22 @@ function subscribeToolChange(onChange: () => void) {
 async function publishTools(tools: ToolRegistration[], signal: AbortSignal) {
   const runtime = document.modelContext;
   if (!runtime) return;
-  if (typeof runtime.registerTools === 'function') {
-    await Promise.resolve(runtime.registerTools(tools, { signal }));
-    return;
+  const work = typeof runtime.registerTools === 'function'
+    ? Promise.resolve(runtime.registerTools(tools, { signal }))
+    : Promise.all(tools.map((tool) => Promise.resolve(runtime.registerTool(tool, { signal }))));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('WEBMCP_REGISTER_TIMEOUT')), 2500);
+    signal.addEventListener('abort', () => {
+      if (timer) clearTimeout(timer);
+      reject(new Error('WEBMCP_REGISTER_ABORTED'));
+    }, { once: true });
+  });
+  try {
+    await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  await Promise.all(tools.map((tool) => Promise.resolve(runtime.registerTool(tool, { signal }))));
 }
 
 async function registerAtomically(tools: ToolRegistration[], signal: AbortSignal) {
@@ -273,6 +307,9 @@ export async function ensureWebMcpRegistration(
   session.pending = registerAtomically(tools, controller.signal).then((result) => {
     if (session.controller === controller) session.pending = null;
     return { supported: result.supported, count: result.count ?? 0, reused: false };
+  }).catch(() => {
+    if (session.controller === controller) session.pending = null;
+    return { supported: false, count: 0, reused: false };
   });
   return session.pending;
 }
