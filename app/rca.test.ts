@@ -33,4 +33,30 @@ test('100% dropout is unreachable packet loss, not a failed component', () => {
   assert.equal(result.primaryCause?.type, 'component_fault');
   assert.match(result.primaryCause?.explanation ?? '', /unreachable/);
   assert.equal(result.recommendedActions[0].tool, 'clear_fault_profile');
+  assert.ok(Number.isFinite(result.primaryCause?.confidence ?? NaN));
+});
+
+test('RCA skips prohibited recoveries and returns a combined surviving-region plan', () => {
+  const result = analyseRootCause({
+    ...healthy,
+    architectureId: 'multi_region_saas',
+    peakRps: 4200,
+    storeVersion: 9,
+    configuredPrimaryPercent: 50,
+    failedRegions: [],
+    faults: [{ targetId: 'region-alb-europe', targetName: 'ALB → europe-west2', targetType: 'connection', latencyMs: 0, dropoutPercent: 40, regions: ['europe-west2'] }],
+    overloadedComponents: [{ id: 'app_us', name: 'Cloud Run app / us-east4', utilisation: 1.1, overflowRps: 80 }],
+    constraints: { unavailableTargets: ['europe-west2'], prohibitedActions: ['clear_fault_profile'] },
+    nodes: [
+      { id: 'cloud_run_us', name: 'Cloud Run ingress / us-east4', region: 'us-east4', kind: 'gateway', capacityPerReplica: 2100, replicas: 2, utilisation: 0.9, overflowRps: 0, legalRemediations: ['set_autoscaling'] },
+      { id: 'app_us', name: 'Cloud Run app / us-east4', region: 'us-east4', kind: 'service', capacityPerReplica: 1900, replicas: 2, utilisation: 1.1, overflowRps: 80, legalRemediations: ['set_autoscaling'] },
+    ],
+    impact: { ...healthy.impact, sloPass: false, sloStatus: 'failing', breachReasons: ['INJECTED DROPOUT'] },
+  });
+  assert.equal(result.recommendedActions.some((action) => action.tool === 'clear_fault_profile'), false);
+  assert.equal(result.recommendedActions[0].tool, 'apply_remediation_plan');
+  assert.ok(result.remediationPlan);
+  assert.deepEqual(result.recommendedActions[0].arguments.steps, result.remediationPlan?.steps);
+  assert.deepEqual(result.remediationPlan?.steps.map((step) => step.op), ['set_autoscaling', 'set_autoscaling', 'set_region_traffic_split']);
+  assert.equal(result.remediationPlan?.steps.at(-1)?.args.primaryPercent, 0);
 });

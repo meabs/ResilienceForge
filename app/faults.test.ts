@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aggregateFaultImpact, normalizeFault } from './faults.ts';
+import { aggregateFaultImpact, normalizeFault, readFaultAmounts } from './faults.ts';
 
 test('fault inputs are clamped to safe deterministic bounds', () => {
   assert.deepEqual(normalizeFault(45_000, -7), { latencyMs: 30_000, dropoutPercent: 0 });
@@ -20,4 +20,10 @@ test('faults on serial full-traffic components compound', () => {
   ]);
   assert.equal(impact.availabilityMultiplier, 0.855);
   assert.equal(impact.latencyMs, 150);
+});
+
+test('packetLossPercent is the explicit unit alias for dropout', () => {
+  assert.deepEqual(readFaultAmounts({ latencyMs: 200, packetLossPercent: 5 }), { latencyMs: 200, dropoutPercent: 5 });
+  assert.deepEqual(readFaultAmounts({ latencyMs: 0, dropoutPercent: 8 }), { latencyMs: 0, dropoutPercent: 8 });
+  assert.deepEqual(readFaultAmounts({ packetLossPercent: 5 }, { latencyMs: 200, dropoutPercent: 0 }), { latencyMs: 200, dropoutPercent: 5 });
 });

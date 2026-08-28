@@ -20,8 +20,8 @@ Environment: standard browser automation (no WebMCP runtime). WebMCP tool regist
 ## Judge path (manual, WebMCP browser)
 
 1. Open the live URL in ChatGPT desktop in-app browser.
-2. Load any reference from Catalogue manually.
-3. Confirm SITE TOOLS is **green** and `get_webmcp_status.toolsReady` is true. Tool count matches `expectedToolCount` for the loaded architecture.
+2. On Catalogue, confirm SITE TOOLS is **green** and the agent can `list_architectures` then `load_architecture`.
+3. After the bench loads, confirm SITE TOOLS is **green** again and `get_webmcp_status.toolsReady` is true. Tool count matches `expectedToolCount` for the loaded architecture.
 4. Ask the agent to call `get_bench_guide`, then `get_bench_snapshot`.
 5. Run `run_stress_test`, attempt remediation, then change peak load or traffic split while the agent works.
 6. Verify stale mutation returns `STALE_STATE`, FDR flashes, `get_decision_log` shows the human `ui` event, and a retry with the new `expectedVersion` succeeds.

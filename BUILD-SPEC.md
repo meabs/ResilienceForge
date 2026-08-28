@@ -35,7 +35,7 @@ The simulation is a **decision-support model**, not production sizing proof. It 
 
 Every scenario must support this loop:
 
-1. **Human chooses** a reference architecture from the Catalogue. No WebMCP tool can choose or load a reference.
+1. **Human or agent loads** a reference architecture from the Catalogue (`list_architectures` then `load_architecture`, or the human Load onto bench control).
 2. **Human configures** scenario controls and project constraints on the Bench.
 3. **External agent discovers tools**, reads the live graph and constraints, then runs a deterministic stress test or failure.
 4. The scenario exhibits its **distinctive failure mode** visibly in graph motion and metrics.
@@ -176,9 +176,9 @@ Each card contains:
 
 No ranking, scores, "recommended", badges or default winner.
 
-Loading is human-only.
+Loading can be human (Load onto bench) or agent (`list_architectures` then `load_architecture`).
 
-`loadArchitecture(id)` is a local UI/domain operation and is not registered as WebMCP.
+`load_architecture` is a Catalogue WebMCP tool. It navigates to `/bench/:id`. Bench mutations stay on the loaded reference.
 
 ## 5.2 Bench (`/bench/:architectureId`)
 
@@ -847,26 +847,17 @@ function resolveWebMcpRuntime(): WebMcpRuntime {
 
 ### 14.1 Lifecycle
 
-Every Bench mount creates an `AbortController`.
+The full site tool set registers once per document with a page-lifetime `AbortController`.
 
-All tools for the loaded architecture register with the same signal.
-
-Leaving Bench or changing architecture aborts the controller and removes those tools.
+Catalogue tools (`list_architectures`, `load_architecture`) and every bench tool share that set. Changing view or architecture rebinds live handlers and does not abort the controller.
 
 ```ts
 useEffect(() => {
-  const controller = new AbortController()
-
-  registerToolsForArchitecture(
-    architectureId,
-    controller.signal
-  )
-
-  return () => controller.abort()
-}, [architectureId])
+  ensureWebMcpRegistration('resilience-forge', makeSiteTools())
+}, [])
 ```
 
-Do not leave tools from the previous reference registered.
+A full document load still registers once. Same-document `load_architecture` must not wait for a second `toolsReady`.
 
 ### 14.2 Return adapter
 
@@ -883,11 +874,11 @@ Do not hard-code browser/MCP envelope details inside every domain command.
 
 ---
 
-## 15. Dynamic tool surface
+## 15. Static site tool surface
 
-Do **not** register irrelevant remediation tools.
+Register the union of Catalogue and Bench tools once. Irrelevant remediations stay callable and return `ILLEGAL_MOVE`, `UNKNOWN_NODE`, or `NO_BENCH_LOADED` rather than disappearing from the catalog.
 
-All Bench scenarios expose the common read tools and relevant failure/remediation tools for that loaded reference.
+All Bench scenarios expose the common read tools. Architecture-specific mutations are always listed; legality is enforced in the domain layer.
 
 ### 15.1 Common read tools
 
@@ -1251,9 +1242,9 @@ Recommended structure:
 
 Show the three equal references and explain:
 
-> "I choose the architecture. The browser agent cannot."
+> "Catalogue SITE TOOLS are live. The agent can load a reference, or I can."
 
-Load checkout manually.
+Load checkout via `load_architecture` or Load onto bench.
 
 ### 0:15–1:05 — Checkout signature WebMCP loop
 

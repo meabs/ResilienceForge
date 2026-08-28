@@ -48,6 +48,48 @@ export function desiredReplicas(
   return Math.min(policy.max, needed);
 }
 
+export const LATENCY_ROUTING = {
+  method: 'inverse_latency_weight' as const,
+  shiftThresholdMs: 50,
+  hysteresisMs: 25,
+  unreachablePacketLossPercent: 100,
+};
+
+export interface LatencyPathScore {
+  latencyMs: number;
+  packetLossPercent: number;
+  down: boolean;
+  score: number;
+}
+
+export interface LatencyRoutingExplanation {
+  enabled: boolean;
+  method: typeof LATENCY_ROUTING.method;
+  shiftThresholdMs: number;
+  hysteresisMs: number;
+  intended: TrafficSplits;
+  effective: TrafficSplits;
+  scores: {
+    europe?: LatencyPathScore;
+    us?: LatencyPathScore;
+    stable?: LatencyPathScore;
+    candidate?: LatencyPathScore;
+  };
+  shiftOccurred: boolean;
+  noShiftReason: string | null;
+  notes: string[];
+}
+
+function pathScore(latencyMs: number, packetLossPercent: number, down: boolean): LatencyPathScore {
+  const unreachable = down || packetLossPercent >= LATENCY_ROUTING.unreachablePacketLossPercent;
+  return {
+    latencyMs,
+    packetLossPercent,
+    down: unreachable,
+    score: unreachable ? 0 : 1 / Math.max(latencyMs, 1),
+  };
+}
+
 export function latencyRouteShares(input: {
   primaryLatencyMs: number;
   secondaryLatencyMs: number;
@@ -75,6 +117,114 @@ export function canaryShareWithLatencyGuard(input: {
   return clampPercent(configured / ratio);
 }
 
+export function explainLatencyRouting(input: {
+  architectureId: ArchitectureId;
+  latencyBasedRouting: boolean;
+  regionPrimaryPercent: number;
+  modelNewPercent: number;
+  europeDown: boolean;
+  usDown: boolean;
+  usExcluded: boolean;
+  candidateDown: boolean;
+  europeLatencyMs: number;
+  usLatencyMs: number;
+  europePacketLossPercent?: number;
+  usPacketLossPercent?: number;
+  stableLatencyMs: number;
+  candidateLatencyMs: number;
+  candidatePacketLossPercent?: number;
+}): LatencyRoutingExplanation {
+  const intended: TrafficSplits = {
+    regionPrimaryPercent: clampPercent(input.regionPrimaryPercent),
+    modelNewPercent: clampPercent(input.modelNewPercent),
+  };
+  const notes: string[] = [];
+  if ((input.europePacketLossPercent ?? 0) > 0 || (input.usPacketLossPercent ?? 0) > 0 || (input.candidatePacketLossPercent ?? 0) > 0) {
+    notes.push('packet_loss_does_not_change_latency_scores_until_unreachable');
+  }
+
+  if (!input.latencyBasedRouting) {
+    return {
+      enabled: false,
+      method: LATENCY_ROUTING.method,
+      shiftThresholdMs: LATENCY_ROUTING.shiftThresholdMs,
+      hysteresisMs: LATENCY_ROUTING.hysteresisMs,
+      intended,
+      effective: intended,
+      scores: {},
+      shiftOccurred: false,
+      noShiftReason: 'routing_disabled',
+      notes,
+    };
+  }
+
+  if (input.architectureId === 'multi_region_saas') {
+    const europe = pathScore(input.europeLatencyMs, input.europePacketLossPercent ?? 0, input.europeDown);
+    const us = pathScore(input.usLatencyMs, input.usPacketLossPercent ?? 0, input.usDown || input.usExcluded);
+    const latencyDeltaMs = Math.abs(europe.latencyMs - us.latencyMs);
+    const belowThreshold = !europe.down && !us.down && latencyDeltaMs < LATENCY_ROUTING.shiftThresholdMs;
+    const routed = belowThreshold
+      ? { primaryPercent: intended.regionPrimaryPercent, secondaryPercent: 100 - intended.regionPrimaryPercent }
+      : latencyRouteShares({
+        primaryLatencyMs: europe.latencyMs,
+        secondaryLatencyMs: us.latencyMs,
+        primaryDown: europe.down,
+        secondaryDown: us.down,
+      });
+    const effective = { ...intended, regionPrimaryPercent: routed.primaryPercent };
+    const shiftOccurred = effective.regionPrimaryPercent !== intended.regionPrimaryPercent;
+    return {
+      enabled: true,
+      method: LATENCY_ROUTING.method,
+      shiftThresholdMs: LATENCY_ROUTING.shiftThresholdMs,
+      hysteresisMs: LATENCY_ROUTING.hysteresisMs,
+      intended,
+      effective,
+      scores: { europe, us },
+      shiftOccurred,
+      noShiftReason: shiftOccurred ? null : belowThreshold ? 'latency_delta_below_threshold' : 'scores_keep_configured_split',
+      notes,
+    };
+  }
+
+  if (input.architectureId === 'llm_inference_serving') {
+    const stable = pathScore(input.stableLatencyMs, 0, false);
+    const candidate = pathScore(input.candidateLatencyMs, input.candidatePacketLossPercent ?? 0, input.candidateDown);
+    const modelNewPercent = canaryShareWithLatencyGuard({
+      configuredNewPercent: intended.modelNewPercent,
+      stableLatencyMs: stable.latencyMs,
+      candidateLatencyMs: candidate.latencyMs,
+      candidateDown: candidate.down,
+    });
+    const effective = { ...intended, modelNewPercent };
+    return {
+      enabled: true,
+      method: LATENCY_ROUTING.method,
+      shiftThresholdMs: LATENCY_ROUTING.shiftThresholdMs,
+      hysteresisMs: LATENCY_ROUTING.hysteresisMs,
+      intended,
+      effective,
+      scores: { stable, candidate },
+      shiftOccurred: effective.modelNewPercent !== intended.modelNewPercent,
+      noShiftReason: effective.modelNewPercent === intended.modelNewPercent ? 'scores_keep_configured_split' : null,
+      notes,
+    };
+  }
+
+  return {
+    enabled: true,
+    method: LATENCY_ROUTING.method,
+    shiftThresholdMs: LATENCY_ROUTING.shiftThresholdMs,
+    hysteresisMs: LATENCY_ROUTING.hysteresisMs,
+    intended,
+    effective: intended,
+    scores: {},
+    shiftOccurred: false,
+    noShiftReason: 'routing_not_applicable',
+    notes,
+  };
+}
+
 export function effectiveTrafficSplits(input: {
   architectureId: ArchitectureId;
   latencyBasedRouting: boolean;
@@ -86,36 +236,11 @@ export function effectiveTrafficSplits(input: {
   candidateDown: boolean;
   europeLatencyMs: number;
   usLatencyMs: number;
+  europePacketLossPercent?: number;
+  usPacketLossPercent?: number;
   stableLatencyMs: number;
   candidateLatencyMs: number;
+  candidatePacketLossPercent?: number;
 }): TrafficSplits {
-  const configured: TrafficSplits = {
-    regionPrimaryPercent: clampPercent(input.regionPrimaryPercent),
-    modelNewPercent: clampPercent(input.modelNewPercent),
-  };
-  if (!input.latencyBasedRouting) return configured;
-
-  if (input.architectureId === 'multi_region_saas') {
-    const routed = latencyRouteShares({
-      primaryLatencyMs: input.europeLatencyMs,
-      secondaryLatencyMs: input.usLatencyMs,
-      primaryDown: input.europeDown,
-      secondaryDown: input.usDown || input.usExcluded,
-    });
-    return { ...configured, regionPrimaryPercent: routed.primaryPercent };
-  }
-
-  if (input.architectureId === 'llm_inference_serving') {
-    return {
-      ...configured,
-      modelNewPercent: canaryShareWithLatencyGuard({
-        configuredNewPercent: configured.modelNewPercent,
-        stableLatencyMs: input.stableLatencyMs,
-        candidateLatencyMs: input.candidateLatencyMs,
-        candidateDown: input.candidateDown,
-      }),
-    };
-  }
-
-  return configured;
+  return explainLatencyRouting(input).effective;
 }

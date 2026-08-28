@@ -5,6 +5,7 @@ import {
   canaryShareWithLatencyGuard,
   desiredReplicas,
   effectiveTrafficSplits,
+  explainLatencyRouting,
   latencyRouteShares,
 } from './traffic.ts';
 
@@ -95,4 +96,51 @@ test('latency routing is inert until enabled', () => {
   assert.equal(off.modelNewPercent, 20);
   const on = effectiveTrafficSplits({ ...off, architectureId: 'llm_inference_serving', latencyBasedRouting: true, regionPrimaryPercent: 50, europeDown: false, usDown: true, usExcluded: false, candidateDown: true, europeLatencyMs: 260, usLatencyMs: 900, stableLatencyMs: 350, candidateLatencyMs: 1500 });
   assert.equal(on.modelNewPercent, 0);
+});
+
+test('small regional latency deltas stay at the configured split and explain why', () => {
+  const explained = explainLatencyRouting({
+    architectureId: 'multi_region_saas',
+    latencyBasedRouting: true,
+    regionPrimaryPercent: 50,
+    modelNewPercent: 20,
+    europeDown: false,
+    usDown: false,
+    usExcluded: false,
+    candidateDown: false,
+    europeLatencyMs: 280,
+    usLatencyMs: 260,
+    europePacketLossPercent: 5,
+    usPacketLossPercent: 0,
+    stableLatencyMs: 350,
+    candidateLatencyMs: 350,
+  });
+  assert.equal(explained.effective.regionPrimaryPercent, 50);
+  assert.equal(explained.shiftOccurred, false);
+  assert.equal(explained.noShiftReason, 'latency_delta_below_threshold');
+  assert.ok(explained.scores.europe?.score);
+  assert.ok(explained.notes.includes('packet_loss_does_not_change_latency_scores_until_unreachable'));
+});
+
+test('100% packet loss marks a regional path unreachable and shifts traffic', () => {
+  const explained = explainLatencyRouting({
+    architectureId: 'multi_region_saas',
+    latencyBasedRouting: true,
+    regionPrimaryPercent: 50,
+    modelNewPercent: 20,
+    europeDown: false,
+    usDown: false,
+    usExcluded: false,
+    candidateDown: false,
+    europeLatencyMs: 260,
+    usLatencyMs: 260,
+    europePacketLossPercent: 100,
+    usPacketLossPercent: 0,
+    stableLatencyMs: 350,
+    candidateLatencyMs: 350,
+  });
+  assert.equal(explained.scores.europe?.down, true);
+  assert.equal(explained.effective.regionPrimaryPercent, 0);
+  assert.equal(explained.shiftOccurred, true);
+  assert.equal(explained.intended.regionPrimaryPercent, 50);
 });

@@ -12,6 +12,7 @@ export const NESTED_OR_READ_OPS = new Set([
   'get_constraints',
   'get_bench_snapshot',
   'get_decision_log',
+  'ramp_fault_until',
 ]);
 
 export interface PlanStep {

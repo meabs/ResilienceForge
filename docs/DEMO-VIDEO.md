@@ -8,9 +8,9 @@ Capture a still of the green SITE TOOLS lamp from this same session and drop it 
 
 Show three equal cards.
 
-Say: “I choose the architecture. The browser agent cannot.”
+Say: “Catalogue SITE TOOLS are live. I can load a reference myself, or the agent can call load_architecture.”
 
-Load Event-driven checkout.
+Ask the agent to load Event-driven checkout, or click Load onto bench.
 
 ## 0:15–1:05 — Signature loop
 

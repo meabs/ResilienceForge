@@ -260,6 +260,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .fault-readout small { letter-spacing: .02em; text-transform: none; }
 .fault-readout.active { border-color: var(--red); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--red) 8%, transparent) 0 5px, transparent 5px 10px); }
 .fault-readout.active span, .fault-readout.active code { color: var(--red); }
+.node-inspector .range-control { margin-top: 8px; }
 .fault-presets { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 .fault-presets.outage-presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .fault-presets button { min-height: 44px; padding: 5px 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); font-family: var(--font-mono); font-size: 8px; letter-spacing: .03em; text-transform: uppercase; cursor: pointer; }
@@ -342,6 +343,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid 
 .scenario-readout small { color: var(--muted); letter-spacing: .03em; text-transform: none; }
 .readout-status.good { color: var(--green); }
 .readout-status.bad { color: var(--red); }
+.readout-status.neutral { color: var(--cyan); }
 .rail-rca.rca-failed, .rail-rca.rca-degraded { background: color-mix(in srgb, var(--red) 4%, var(--steel)); }
 .rca-primary { padding: 10px; border: 1px dashed color-mix(in srgb, var(--red) 66%, var(--line)); background: color-mix(in srgb, var(--red) 7%, var(--graphite-2)); display: grid; gap: 5px; animation: failure-border 1.15s ease-in-out infinite alternate; }
 .rca-primary span, .rca-primary small { color: var(--quiet); font-family: var(--font-mono); font-size: 8px; letter-spacing: .06em; }

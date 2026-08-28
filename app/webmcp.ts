@@ -98,6 +98,12 @@ export function bindLiveBench(handlers: LiveHandlers) {
   liveBench.read = handlers.read;
 }
 
+export function unbindLiveBench() {
+  liveBench.getState = () => null;
+  liveBench.invoke = () => ({ ok: false, code: 'NO_BENCH_LOADED', message: 'No reference is loaded. Call load_architecture first.' });
+  liveBench.read = () => ({ ok: false, code: 'NO_BENCH_LOADED', message: 'No reference is loaded. Call load_architecture first.' });
+}
+
 export function getWebMcpStatus(): WebMcpStatus {
   return {
     capability: session.capability,

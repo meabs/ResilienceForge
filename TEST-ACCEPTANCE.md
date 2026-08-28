@@ -97,7 +97,7 @@ Before filming, all three flows must work live.
 
 The video must visibly show:
 
-- human-only reference selection;
+- Catalogue `load_architecture` plus human Load onto bench;
 - external agent using site tools;
 - at least one stale-state conflict;
 - an ordinary human control change altering agent behaviour;

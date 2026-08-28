@@ -10,12 +10,14 @@ Resilience Forge is a shared human-and-browser-agent operations bench for testin
 
 ## Judge prompt
 
-Open the live URL in **ChatGPT desktop’s in-app browser** (SITE TOOLS must be green). Standard Chrome stays amber. Load is human-only — the agent cannot choose the reference.
+Open the live URL in **ChatGPT desktop’s in-app browser** (SITE TOOLS must be green). Standard Chrome stays amber. From the Catalogue, the agent can `list_architectures` and `load_architecture` onto the bench. On the Bench, pins and ordinary controls stay human-owned.
 
-Paste:
+Paste on the Catalogue or after a reference is loaded:
 
 ```
 You are on Resilience Forge. Wait until get_webmcp_status.toolsReady is true, or html[data-webmcp-ready]=true.
+
+If you are on the Catalogue, call list_architectures, then load_architecture with checkout, saas, or llm. Site tools stay registered. Then call get_bench_guide and get_bench_snapshot.
 
 1. Call get_bench_guide, then get_bench_snapshot.
 2. Run the distinctive stress for this reference.
@@ -80,7 +82,7 @@ The production build is emitted by Vinext for the Cloudflare Workers-compatible 
 
 ## WebMCP implementation
 
-The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). Tools register in `useLayoutEffect` against a page-lifetime AbortSignal: React remounts and tab handoffs do not abort the set. `ready` / `toolsReady` is set only after `registerTool`/`registerTools` finishes **and** `getTools()` lists every expected name (or `toolchange` reports the full catalog). Agents should wait for `html[data-webmcp-ready]=true`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady` before treating the full tool set as live. `html[data-webmcp-capability]` is written on first paint so hosts can see support before discovery.
+The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). The full site tool set registers once per document against a page-lifetime AbortSignal. Catalogue and Bench share that set; `load_architecture` is a same-document navigation and does not re-register. `ready` / `toolsReady` is set only after `registerTool`/`registerTools` finishes **and** `getTools()` lists every expected name (or `toolchange` reports the full catalog). Agents should wait for `html[data-webmcp-ready]=true`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady` once after first paint. `html[data-webmcp-capability]` is written on first paint so hosts can see support before discovery.
 
 Each `tool` contains `name`, `title`, `description`, `inputSchema`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`), and `execute`. `execute` honors an AbortSignal as its second argument and returns `ABORTED` if cancelled before it runs. Live handlers are rebound across tab remounts so the session can continue without rediscovery when the same architecture is still loaded.
 

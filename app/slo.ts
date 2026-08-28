@@ -16,6 +16,8 @@ export function releaseEndpointReasons(utilisation: number, overflowRps: number)
   return [];
 }
 
+export type SloStatus = 'not_tested' | 'passing' | 'failing';
+
 export function evaluateSlo(input: SloInputs) {
   return input.stressActive
     && input.availability >= input.availabilityTarget
@@ -23,4 +25,9 @@ export function evaluateSlo(input: SloInputs) {
     && input.errorRate <= 1 - input.availabilityTarget
     && input.cost <= input.budget
     && input.breachReasons.length === 0;
+}
+
+export function classifySlo(input: SloInputs): SloStatus {
+  if (!input.stressActive) return 'not_tested';
+  return evaluateSlo(input) ? 'passing' : 'failing';
 }
