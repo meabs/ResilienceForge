@@ -26,7 +26,7 @@ import { formatFdrCopy, isRejectedCode, visibleFdrEntries } from './fdr';
 import { classifySlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RcaConstraints, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
-import { gcpIconFor } from './gcp-icons';
+import { ArchitectureIcon } from './architecture-icons';
 import { connectionGeometry, connectionPath, percentBoxStyle, type GraphPoint } from './topology-layout';
 import {
   assignedTrafficShare,
@@ -1880,8 +1880,8 @@ function TopologyThumbnail({ architecture }: { architecture: ArchitectureDefinit
       : ['client', 'gateway', 'service', 'gpu', 'gpu'];
   return (
     <div className={`topology-thumbnail ${mode}`} aria-label={`${architecture.name} topology thumbnail`}>
-      <div className="thumbnail-gcp-icons" aria-hidden="true">
-        {iconKinds.map((kind, index) => <img key={`${kind}-${index}`} src={gcpIconFor(kind as NodeDefinition['kind'])} alt="" />)}
+      <div className="thumbnail-architecture-icons" aria-hidden="true">
+        {iconKinds.map((kind, index) => <ArchitectureIcon key={`${kind}-${index}`} kind={kind as NodeDefinition['kind']} className="thumbnail-architecture-icon" />)}
       </div>
       <svg viewBox="0 0 320 108" role="img" aria-hidden="true">
         {mode === 'event_driven_checkout' && (
@@ -2286,7 +2286,7 @@ function TopologyCanvas({ architecture, state, selectedNodeId, onSelectNode, inv
         const isSelected = node.id === selectedNodeId;
         return (
           <button key={node.id} className={`graph-node node-${health} ${accentClass[node.accent]} ${isSelected ? 'selected' : ''} ${state.faults[node.id] ? 'fault-active' : ''} ${state.lastMutation?.targetId === node.id ? `mutation-${state.lastMutation.source}` : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%` }} onClick={() => onSelectNode(isSelected ? '' : node.id)} aria-expanded={isSelected} aria-label={`Inspect ${node.name}, ${healthLabel(health)}`}>
-            <span className="node-top"><img src={gcpIconFor(node.kind)} alt="" className="gcp-node-icon" /><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
+            <span className="node-top"><ArchitectureIcon kind={node.kind} className="architecture-node-icon" /><span className="health-pip" data-state={healthLabel(health)} /> <span>{node.shortName}</span></span>
             <strong>{node.name}</strong>
             {metric?.replicaZones.length ? <span className="replica-spread" aria-label={`${metric.availableReplicas} of ${metric.provisionedReplicas} replicas available`}>{metric.replicaZones.map((zone, index) => <i key={`${zone}-${index}`} className={state.failedZones.includes(zone) ? 'failed' : ''} title={`${zone} replica ${index + 1}`}><span>{zoneShortLabel(zone)}</span></i>)}</span> : null}
             {state.faults[node.id] ? <span className="fault-mark">FAULT · +{state.faults[node.id].latencyMs} ms · {state.faults[node.id].dropoutPercent}% packet loss</span> : null}

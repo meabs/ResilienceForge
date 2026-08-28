@@ -11,6 +11,6 @@ Hero shots for judges and Devpost gallery.
 | [DEVPOST.md](./DEVPOST.md) | Devpost text for the four required prompts |
 | [DEMO-VIDEO.md](./DEMO-VIDEO.md) | 2:30 shot list and narration |
 
-Open the live project in ChatGPT's in-app browser to see SITE TOOLS register (green lamp). Standard browsers show amber because `document.modelContext` is unavailable outside a WebMCP-enabled session. `list_architectures` and `load_architecture` are Catalogue tools on that same registered set.
+Open the live project in ChatGPT's in-app browser to see SITE TOOLS register (green lamp). Standard browsers show amber because `document.modelContext` is unavailable outside a WebMCP-enabled session. `list_architectures` and `load_architecture` are Catalogue tools on that same registered set. Architecture visuals use original neutral glyphs; Google Cloud product names remain descriptive text in the reference models.
 
 See [SMOKE-TEST.md](./SMOKE-TEST.md) for the latest production verification run.
