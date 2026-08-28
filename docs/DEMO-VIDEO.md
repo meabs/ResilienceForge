@@ -6,11 +6,11 @@ Capture a still of the green SITE TOOLS lamp from this same session and drop it 
 
 ## 0:00–0:15 — Catalogue
 
-Show three equal cards.
+Show three equal cards. SITE TOOLS is already green: the full site tool set is registered here, not later on the Bench.
 
-Say: “Catalogue SITE TOOLS are live. I can load a reference myself, or the agent can call load_architecture.”
+Say: “Catalogue SITE TOOLS are live. I can load a reference myself, or the agent can call list_architectures then load_architecture.”
 
-Ask the agent to load Event-driven checkout, or click Load onto bench.
+Ask the agent to load Event-driven checkout, or click Load onto bench. Do not wait for a second `toolsReady`.
 
 ## 0:15–1:05 — Signature loop
 
@@ -27,15 +27,15 @@ This beat must be readable without a code cutaway.
 
 ## 1:05–1:40 — Multi-region
 
-Catalogue → Multi-region SaaS. Fail us-east4. Agent reroutes. You move Primary traffic allocation. Stale write, re-read, scale for the human split.
+Agent `load_architecture` saas, or Catalogue → Multi-region SaaS. Fail us-east4. Agent reroutes. You move Primary traffic allocation. Stale write, re-read, scale for the human split. Optional: `set_region_fault_profile` on West2.
 
 ## 1:40–2:15 — LLM serving
 
-Load LLM inference. New-model path saturates. You drag New model traffic. Agent adapts split/capacity. Optional: pin Keep old model.
+Load LLM inference (`load_architecture` llm). New-model path saturates. You drag New model traffic. Agent adapts split/capacity. Optional: pin Keep old model.
 
 ## 2:15–2:30 — Proof
 
-Zoom FDR: `ui` + `webmcp` + `STALE_STATE`. Copy log if useful. Lamp stays green.
+Zoom FDR: `ui` + `webmcp` + `STALE_STATE`. Copy log if useful. Lamp stays green after switching architectures. Tools did not re-register.
 
 Do not end on a feature list.
 

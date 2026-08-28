@@ -7,7 +7,7 @@ All three scenarios are first-class. A release candidate fails if any scenario l
 | ID | Test | Expected |
 |---|---|---|
 | CORE-01 | Load each Catalogue card | Correct static topology and scenario defaults load |
-| CORE-02 | Leave Bench | WebMCP tools unregister |
+| CORE-02 | Leave Bench / switch architecture | Site tools stay registered. Live handlers rebind. No second `toolsReady`. |
 | CORE-03 | WebMCP unavailable | App still functions; SITE TOOLS amber |
 | CORE-04 | UI stress vs WebMCP stress | Same domain path and deterministic result |
 | CORE-05 | Human mutation while agent uses stale version | Agent mutation rejected `STALE_STATE` |
@@ -66,9 +66,9 @@ All three scenarios are first-class. A release candidate fails if any scenario l
 
 For every architecture:
 
-1. load reference manually;
-2. confirm SITE TOOLS green;
-3. call `get_architecture`;
+1. load reference from Catalogue with `load_architecture` or Load onto bench;
+2. confirm SITE TOOLS green and `get_webmcp_status.toolsReady` is true;
+3. call `get_bench_snapshot` and confirm version, metrics, constraints, and topology;
 4. verify FDR entry;
 5. run relevant stress/failure tool;
 6. verify canvas/gauge causality;
@@ -76,11 +76,12 @@ For every architecture:
 8. change an ordinary human control (peak RPS/budget, region allocation or model split);
 9. invoke stale mutation using prior version;
 10. verify `STALE_STATE`;
-11. re-read semantic live metrics/constraints;
+11. re-read `get_decision_log` and `get_bench_snapshot`;
 12. perform legal remediation from new version;
-13. separately enable a hard pin and verify `PINNED_*` enforcement.
+13. separately enable a hard pin and verify `PINNED_*` enforcement, including inside `apply_remediation_plan`;
+14. `reset_scenario` restores a clean baseline; switching architectures does not leak the previous scenario's faults or outages.
 
-Tool registration must be architecture-specific. Irrelevant remediation tools must not remain registered from a previously loaded reference.
+The full site tool set stays registered across Catalogue and every Bench. Irrelevant remediations remain listed and return `ILLEGAL_MOVE`, `UNKNOWN_NODE`, or `NO_BENCH_LOADED`.
 
 # 6. Data/provenance acceptance
 

@@ -823,7 +823,7 @@ Cost is secondary to the WebMCP loop. If cost accuracy becomes a distraction, si
 
 ## 14. WebMCP architecture
 
-Use the imperative API on the Bench only.
+Use the imperative API once per document for the full site tool set. Catalogue and Bench share that set.
 
 Primary current surface:
 
@@ -884,10 +884,18 @@ All Bench scenarios expose the common read tools. Architecture-specific mutation
 
 | Tool | Purpose | Minimum structured content |
 |---|---|---|
+| `get_webmcp_status` | capability, toolsReady, session, registered names | toolsReady, view, loadedArchitectureId, expectedToolCount |
+| `get_catalogue_guide` | how to pick and load a reference | loop, architectures |
+| `list_architectures` | three equal GCP references | architectures[] |
+| `load_architecture` | same-document navigation onto a bench | id or alias such as checkout, saas, llm |
+| `get_bench_guide` | signature loop and legal remediations | error codes, pins, remediationPaths |
 | `get_architecture` | semantic graph and runtime topology | architectureId, nodes, edges, effective health, failed/excluded regions/zones, store version |
-| `get_scenario` | current human intent | scenario values, pins, targets, budget, current traffic/split controls, store version |
-| `get_live_metrics` | machine-readable operational state | SimResult plus per-node demand, served throughput, capacity, utilisation/headroom, queue depth/overflow, TTFT where relevant, and `observations[]` |
+| `get_scenario` | current human intent | scenario values, pins, targets, budget, current traffic/split controls, routing, store version |
+| `get_live_metrics` | machine-readable operational state | SimResult plus per-node demand, served throughput, capacity, utilisation/headroom, queue depth/overflow, TTFT where relevant, routing, and `observations[]` |
 | `get_constraints` | machine-readable limits and assumptions | applicable constraint records, current usage, headroom, sourceType, sourceDate and source URL when provider-sourced |
+| `get_bench_snapshot` | one-tick atomic read | scenario, topology, metrics, constraints, RCA, storeVersion, tick |
+| `get_decision_log` | Flight Data Recorder | ui / webmcp / sim entries, versions, result codes |
+| `preview_change` | read-only projection | projectionSucceeded, before/after, unchanged storeVersion |
 
 `observations[]` contains factual machine tokens, not recommendations. Example:
 
@@ -910,8 +918,12 @@ A judge should be able to see that WebMCP gives the browser agent semantic acces
 | Tool | Purpose |
 |---|---|
 | `run_stress_test` | start deterministic stress run |
-| `kill_component` | runtime failure of a component |
+| `fail_component` | hard outage of a component |
 | `restore_component` | restore a killed component |
+| `set_fault_profile` | inject latencyMs and packetLossPercent |
+| `set_region_fault_profile` | apply the same fault at a regional boundary |
+| `ramp_fault_until` | ramp a fault in one versioned mutation |
+| `apply_remediation_plan` | atomic multi-step remediation; cannot bypass pins |
 
 ### 15.3 Checkout-specific tools
 

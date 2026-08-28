@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { applyPlanSteps, parseRemediationSteps } from './bench-ops.ts';
+import { pinRejection } from './pins.ts';
 
 test('plan parser rejects empty, oversized, nested, and malformed steps', () => {
   assert.equal(parseRemediationSteps([]).ok, false);
@@ -41,4 +42,24 @@ test('applyPlanSteps is all-or-nothing', () => {
   }));
   assert.equal(passed.ok, true);
   if (passed.ok) assert.equal(passed.state, 12);
+});
+
+test('apply_remediation_plan cannot bypass a pinned traffic split', () => {
+  const parsed = parseRemediationSteps([
+    { op: 'set_autoscaling', args: { id: 'app_us', min: 4, max: 8 } },
+    { op: 'set_region_traffic_split', args: { primaryPercent: 0 } },
+  ]);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  const pins = ['no_second_region'] as const;
+  const result = applyPlanSteps({}, parsed.steps, (state, op, args) => {
+    const pinned = pinRejection([...pins], op, args);
+    if (pinned) return { state, result: pinned };
+    return { state, result: { ok: true as const } };
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.failedOp, 'set_region_traffic_split');
+    assert.equal(result.code, 'PINNED_NO_SECOND_REGION');
+  }
 });

@@ -1918,7 +1918,7 @@ function SiteToolsLamp({ status, count = 0 }: { status: 'off' | 'green' | 'amber
     : status === 'registering' ? `WebMCP registering ${count} tools`
       : status === 'amber' ? 'WebMCP unavailable'
         : status === 'red' ? 'WebMCP registration error'
-          : 'SITE TOOLS off on Catalogue';
+          : 'SITE TOOLS idle';
   const mark = status === 'off' ? 'OFF' : status === 'green' ? 'LIVE' : status === 'registering' ? 'REGISTERING' : status.toUpperCase();
   return <span className={`site-tools-lamp ${status}`} title={label} aria-label={`SITE TOOLS ${mark}. ${label}`}><span className="lamp-dot" aria-hidden="true" /> <span>SITE TOOLS</span><b>{mark}</b></span>;
 }
