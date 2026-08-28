@@ -8,6 +8,10 @@ export interface ToolRegistration {
 
 interface ModelContext {
   registerTool: (tool: ToolRegistration, options?: { signal?: AbortSignal }) => void | Promise<void>;
+  registerTools?: (tools: ToolRegistration[], options?: { signal?: AbortSignal }) => void | Promise<void>;
+  getTools?: () => Promise<Array<{ name?: string }>>;
+  addEventListener?: (type: string, listener: EventListenerOrEventListenerObject, options?: AddEventListenerOptions | boolean) => void;
+  removeEventListener?: (type: string, listener: EventListenerOrEventListenerObject, options?: EventListenerOptions | boolean) => void;
 }
 
 declare global {
@@ -25,6 +29,7 @@ export interface WebMcpStatus {
   toolsReady: boolean;
   expectedToolCount: number;
   registeredToolCount: number;
+  discoveredToolCount: number;
   sessionId: string;
   architectureId: string | null;
   toolNames: string[];
@@ -36,8 +41,6 @@ type LiveHandlers = {
   read: (op: string, args: Record<string, unknown>, payload: Record<string, unknown>) => unknown;
 };
 
-const RELEASE_GRACE_MS = 750;
-
 export const liveBench: LiveHandlers = {
   getState: () => null,
   invoke: () => ({ ok: false, code: 'WEBMCP_NOT_BOUND' }),
@@ -46,7 +49,6 @@ export const liveBench: LiveHandlers = {
 
 const session: WebMcpStatus & {
   controller: AbortController | null;
-  releaseTimer: ReturnType<typeof setTimeout> | null;
   pending: Promise<{ supported: boolean; count: number; reused: boolean }> | null;
 } = {
   capability: 'unsupported',
@@ -54,11 +56,11 @@ const session: WebMcpStatus & {
   toolsReady: false,
   expectedToolCount: 0,
   registeredToolCount: 0,
+  discoveredToolCount: 0,
   sessionId: '',
   architectureId: null,
   toolNames: [],
   controller: null,
-  releaseTimer: null,
   pending: null,
 };
 
@@ -80,6 +82,7 @@ export function getWebMcpStatus(): WebMcpStatus {
     toolsReady: session.ready,
     expectedToolCount: session.expectedToolCount,
     registeredToolCount: session.registeredToolCount,
+    discoveredToolCount: session.discoveredToolCount,
     sessionId: session.sessionId,
     architectureId: session.architectureId,
     toolNames: [...session.toolNames],
@@ -92,7 +95,7 @@ export function publishCapability() {
   const root = document.documentElement;
   root.dataset.webmcpCapability = status.capability;
   root.dataset.webmcpReady = status.ready ? 'true' : 'false';
-  root.dataset.webmcpToolCount = String(status.registeredToolCount);
+  root.dataset.webmcpToolCount = String(status.discoveredToolCount || status.registeredToolCount);
   root.dataset.webmcpExpectedCount = String(status.expectedToolCount);
   if (status.sessionId) root.dataset.webmcpSession = status.sessionId;
   if (status.architectureId) root.dataset.webmcpArchitecture = status.architectureId;
@@ -101,8 +104,8 @@ export function publishCapability() {
     banner.textContent = status.capability === 'unsupported'
       ? 'WebMCP capability: unsupported in this browser.'
       : status.ready
-        ? `WebMCP capability: supported. Tools ready ${status.registeredToolCount}/${status.expectedToolCount}. Session ${status.sessionId}.`
-        : `WebMCP capability: supported. Tools registering ${status.registeredToolCount}/${status.expectedToolCount}. Do not invoke the full set until ready.`;
+        ? `WebMCP capability: supported. Tools ready ${status.discoveredToolCount}/${status.expectedToolCount}. Session ${status.sessionId}.`
+        : `WebMCP capability: supported. Tools registering ${status.discoveredToolCount}/${status.expectedToolCount}. Do not invoke the full set until ready.`;
   }
   if (typeof window !== 'undefined') {
     window.resilienceForge = {
@@ -126,32 +129,122 @@ export function detectCapability() {
   return getWebMcpStatus();
 }
 
+export function watchModelContext(onReady: () => void) {
+  if (typeof document === 'undefined') return () => undefined;
+  if (document.modelContext) {
+    onReady();
+    return () => undefined;
+  }
+  const timer = window.setInterval(() => {
+    if (!document.modelContext) return;
+    window.clearInterval(timer);
+    onReady();
+  }, 16);
+  return () => window.clearInterval(timer);
+}
+
+export async function waitUntilCatalogMatches(
+  expectedNames: string[],
+  getTools: () => Promise<Array<{ name?: string }>>,
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    pollMs?: number;
+    subscribe?: (onChange: () => void) => () => void;
+  } = {},
+): Promise<{ matched: boolean; names: string[] }> {
+  const timeoutMs = options.timeoutMs ?? 2000;
+  const pollMs = options.pollMs ?? 32;
+  const started = Date.now();
+  const readNames = async () => {
+    try {
+      const listed = await getTools();
+      return listed.map((tool) => tool.name).filter((name): name is string => Boolean(name));
+    } catch {
+      return [] as string[];
+    }
+  };
+  const matches = (names: string[]) => expectedNames.length > 0 && expectedNames.every((name) => names.includes(name));
+
+  let names = await readNames();
+  if (matches(names) || options.signal?.aborted) return { matched: matches(names), names };
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (matched: boolean, nextNames: string[]) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ matched, names: nextNames });
+    };
+    const tick = async () => {
+      if (options.signal?.aborted) {
+        finish(false, names);
+        return;
+      }
+      names = await readNames();
+      if (matches(names) || Date.now() - started >= timeoutMs) finish(matches(names), names);
+    };
+    const unsubscribe = options.subscribe?.(() => { void tick(); }) ?? (() => undefined);
+    const poll = setInterval(() => { void tick(); }, pollMs);
+    const timeout = setTimeout(() => { void tick(); }, timeoutMs);
+    const onAbort = () => finish(false, names);
+    options.signal?.addEventListener('abort', onAbort);
+    const cleanup = () => {
+      unsubscribe();
+      clearInterval(poll);
+      clearTimeout(timeout);
+      options.signal?.removeEventListener('abort', onAbort);
+    };
+  });
+}
+
+function subscribeToolChange(onChange: () => void) {
+  const runtime = document.modelContext;
+  if (!runtime?.addEventListener) return () => undefined;
+  runtime.addEventListener('toolchange', onChange);
+  return () => runtime.removeEventListener?.('toolchange', onChange);
+}
+
+async function publishTools(tools: ToolRegistration[], signal: AbortSignal) {
+  const runtime = document.modelContext;
+  if (!runtime) return;
+  if (typeof runtime.registerTools === 'function') {
+    await Promise.resolve(runtime.registerTools(tools, { signal }));
+    return;
+  }
+  await Promise.all(tools.map((tool) => Promise.resolve(runtime.registerTool(tool, { signal }))));
+}
+
 async function registerAtomically(tools: ToolRegistration[], signal: AbortSignal) {
   if (!document.modelContext) return { supported: false as const, count: 0 };
+  const names = tools.map((tool) => tool.name);
   session.ready = false;
   session.toolsReady = false;
   session.registeredToolCount = 0;
+  session.discoveredToolCount = 0;
   session.expectedToolCount = tools.length;
-  session.toolNames = tools.map((tool) => tool.name);
+  session.toolNames = names;
   publishCapability();
-  const registrations = tools.map((tool) => Promise.resolve(document.modelContext!.registerTool(tool, { signal })));
-  await Promise.all(registrations);
+  await publishTools(tools, signal);
   if (signal.aborted) return { supported: true as const, count: 0, aborted: true as const };
   session.registeredToolCount = tools.length;
+  const runtime = document.modelContext;
+  const catalog = runtime?.getTools
+    ? await waitUntilCatalogMatches(names, () => runtime.getTools!(), { signal, subscribe: subscribeToolChange })
+    : { matched: true, names };
+  if (signal.aborted) return { supported: true as const, count: 0, aborted: true as const };
+  session.discoveredToolCount = catalog.matched ? tools.length : catalog.names.length;
   session.ready = true;
   session.toolsReady = true;
   publishCapability();
-  return { supported: true as const, count: tools.length, aborted: false as const };
+  return { supported: true as const, count: tools.length, aborted: false as const, discovered: catalog.matched };
 }
 
 export async function ensureWebMcpRegistration(
   architectureId: string,
   tools: ToolRegistration[],
 ) {
-  if (session.releaseTimer) {
-    clearTimeout(session.releaseTimer);
-    session.releaseTimer = null;
-  }
   const runtime = resolveWebMcpRuntime();
   session.capability = runtime ? 'supported' : 'unsupported';
   if (!runtime || !document.modelContext) {
@@ -160,6 +253,7 @@ export async function ensureWebMcpRegistration(
     session.architectureId = architectureId;
     session.expectedToolCount = tools.length;
     session.registeredToolCount = 0;
+    session.discoveredToolCount = 0;
     publishCapability();
     return { supported: false, count: 0, reused: false };
   }
@@ -183,16 +277,15 @@ export async function ensureWebMcpRegistration(
   return session.pending;
 }
 
-export function scheduleWebMcpRelease(architectureId: string) {
-  if (session.releaseTimer) clearTimeout(session.releaseTimer);
-  session.releaseTimer = setTimeout(() => {
-    if (session.architectureId !== architectureId) return;
-    session.controller?.abort();
-    session.controller = null;
-    session.ready = false;
-    session.toolsReady = false;
-    session.registeredToolCount = 0;
-    session.architectureId = null;
-    publishCapability();
-  }, RELEASE_GRACE_MS);
+export function releaseWebMcpRegistration() {
+  session.controller?.abort();
+  session.controller = null;
+  session.pending = null;
+  session.ready = false;
+  session.toolsReady = false;
+  session.registeredToolCount = 0;
+  session.discoveredToolCount = 0;
+  session.architectureId = null;
+  session.toolNames = [];
+  publishCapability();
 }

@@ -26,7 +26,7 @@ import {
 } from './data';
 import { availableReplicaCount, replicaHealth } from './availability';
 import { aggregateFaultImpact, normalizeFault, type FaultProfile } from './faults';
-import { bindLiveBench, detectCapability, ensureWebMcpRegistration, getWebMcpStatus, liveBench, scheduleWebMcpRelease, type ToolRegistration } from './webmcp';
+import { bindLiveBench, detectCapability, ensureWebMcpRegistration, getWebMcpStatus, liveBench, releaseWebMcpRegistration, watchModelContext, type ToolRegistration } from './webmcp';
 import { evaluateSlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
@@ -1487,6 +1487,9 @@ function SiteToolsLamp({ status, count = 0 }: { status: 'off' | 'green' | 'amber
 }
 
 function CatalogueView() {
+  useLayoutEffect(() => {
+    releaseWebMcpRegistration();
+  }, []);
   return (
     <main className="app-shell catalogue-shell">
       <header className="topbar">
@@ -1951,6 +1954,33 @@ function BenchView({ architectureId }: { architectureId: string }) {
     };
   });
 
+  useLayoutEffect(() => {
+    let cancelled = false;
+    const tools = makeTools(architecture);
+    const start = () => {
+      detectCapability();
+      ensureWebMcpRegistration(architecture.id, tools)
+        .then((result) => {
+          if (cancelled) return;
+          if (result.supported) {
+            setToolStatus('green');
+            setToolCount(result.count);
+          } else {
+            setToolStatus('amber');
+            setToolCount(0);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setToolStatus('red');
+        });
+    };
+    const stopWatch = watchModelContext(start);
+    return () => {
+      cancelled = true;
+      stopWatch();
+    };
+  }, [architecture]);
+
   useEffect(() => {
     if (!state.running) return;
     const timer = window.setInterval(() => {
@@ -1962,30 +1992,6 @@ function BenchView({ architectureId }: { architectureId: string }) {
     }, 500);
     return () => window.clearInterval(timer);
   }, [architecture, commit, state.running]);
-
-  useEffect(() => {
-    const tools = makeTools(architecture);
-    let cancelled = false;
-    detectCapability();
-    ensureWebMcpRegistration(architecture.id, tools)
-      .then((result) => {
-        if (cancelled) return;
-        if (result.supported) {
-          setToolStatus('green');
-          setToolCount(result.count);
-        } else {
-          setToolStatus('amber');
-          setToolCount(0);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setToolStatus('red');
-      });
-    return () => {
-      cancelled = true;
-      scheduleWebMcpRelease(architecture.id);
-    };
-  }, [architecture]);
 
   const selectedNode = useMemo(() => architecture.nodes.find((node) => node.id === selectedNodeId), [architecture.nodes, selectedNodeId]);
   return (

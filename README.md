@@ -57,7 +57,7 @@ The production build is emitted by Vinext for the Cloudflare Workers-compatible 
 
 ## WebMCP implementation
 
-The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). Tools are registered together with `Promise.all`; `ready` / `toolsReady` is set only after every `registerTool` call succeeds. Agents should wait for `html[data-webmcp-ready]=true`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady` before treating the full tool set as live. `html[data-webmcp-capability]` is written on first paint so hosts can see support before discovery.
+The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). Tools register in `useLayoutEffect` against a page-lifetime AbortSignal: React remounts and tab handoffs do not abort the set. `ready` / `toolsReady` is set only after `registerTool`/`registerTools` finishes **and** `getTools()` lists every expected name (or `toolchange` reports the full catalog). Agents should wait for `html[data-webmcp-ready]=true`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady` before treating the full tool set as live. `html[data-webmcp-capability]` is written on first paint so hosts can see support before discovery.
 
 Each `tool` contains the required `name`, `description`, `inputSchema`, and `execute` fields. Live handlers are rebound across tab remounts so the session can continue without rediscovery when the same architecture is still loaded.
 
