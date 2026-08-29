@@ -27,7 +27,7 @@ import { classifySlo, releaseEndpointReasons } from './slo';
 import { analyseRootCause, type RcaConstraints, type RootCauseAnalysis } from './rca';
 import { gcpTopologyFrame } from './gcp-layout';
 import { ArchitectureIcon } from './architecture-icons';
-import { connectionGeometry, connectionPath, percentBoxStyle, type GraphPoint } from './topology-layout';
+import { connectionGeometry, connectionPath, percentBoxStyle, thumbnailEdgePath, type GraphPoint } from './topology-layout';
 import {
   assignedTrafficShare,
   desiredReplicas,
@@ -1872,38 +1872,34 @@ function runCommandFor(
 }
 
 function TopologyThumbnail({ architecture }: { architecture: ArchitectureDefinition }) {
-  const mode = architecture.id;
-  const iconKinds = mode === 'event_driven_checkout'
-    ? ['client', 'gateway', 'service', 'queue', 'service']
-    : mode === 'multi_region_saas'
-      ? ['edge', 'gateway', 'service', 'db', 'cache']
-      : ['client', 'gateway', 'service', 'gpu', 'gpu'];
+  const nodes = useMemo(() => new Map(architecture.nodes.map((node) => [node.id, node])), [architecture]);
+  const frame = useMemo(() => gcpTopologyFrame(architecture, [], []), [architecture]);
   return (
-    <div className={`topology-thumbnail ${mode}`} aria-label={`${architecture.name} topology thumbnail`}>
-      <div className="thumbnail-architecture-icons" aria-hidden="true">
-        {iconKinds.map((kind, index) => <ArchitectureIcon key={`${kind}-${index}`} kind={kind as NodeDefinition['kind']} className="thumbnail-architecture-icon" />)}
+    <div className="topology-thumbnail" aria-label={`${architecture.name} topology thumbnail`}>
+      <div className="thumb-stage">
+        {frame.globalBox && (
+          <div className="thumb-frame thumb-frame-global" style={percentBoxStyle(frame.globalBox)}>
+            <span>global</span>
+          </div>
+        )}
+        {frame.regions.map((region) => (
+          <div className="thumb-frame" key={region.key} style={percentBoxStyle(region.box)}>
+            <span>{region.label}</span>
+          </div>
+        ))}
+        <svg className="thumb-edges" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          {architecture.edges.map((edge, index) => {
+            const path = thumbnailEdgePath(edge, nodes);
+            if (!path) return null;
+            return <path className={edge.kind === 'async' ? 'thumb-edge edge-async' : 'thumb-edge'} d={path} key={edge.id} style={{ animationDelay: `${index * 0.11}s` }} />;
+          })}
+        </svg>
+        {architecture.nodes.map((node) => (
+          <div className={`thumb-node accent-${node.accent}`} key={node.id} style={{ left: `${node.x}%`, top: `${node.y}%` }}>
+            <ArchitectureIcon className="thumb-node-icon" kind={node.kind} />
+          </div>
+        ))}
       </div>
-      <svg viewBox="0 0 320 108" role="img" aria-hidden="true">
-        {mode === 'event_driven_checkout' && (
-          <>
-            <path d="M22 54H82M104 54H145M167 54H210M232 54H294M145 66L120 91M167 66L205 91" />
-            <circle cx="22" cy="54" r="8" /><circle cx="93" cy="54" r="8" /><circle cx="156" cy="54" r="11" /><circle cx="221" cy="54" r="11" /><circle cx="298" cy="54" r="8" />
-            <rect x="108" y="84" width="25" height="12" rx="2" /><rect x="193" y="84" width="25" height="12" rx="2" />
-          </>
-        )}
-        {mode === 'multi_region_saas' && (
-          <>
-            <path d="M28 54L88 29M28 54L88 79M110 29H170M110 79H170M192 29H248M192 79H248M265 29L296 54M265 79L296 54" />
-            <circle cx="28" cy="54" r="9" /><circle cx="99" cy="29" r="8" /><circle cx="99" cy="79" r="8" /><circle cx="181" cy="29" r="8" /><circle cx="181" cy="79" r="8" /><rect x="250" y="20" width="25" height="18" rx="2" /><rect x="250" y="70" width="25" height="18" rx="2" /><circle cx="300" cy="54" r="9" />
-          </>
-        )}
-        {mode === 'llm_inference_serving' && (
-          <>
-            <path d="M22 54H86M108 54H150M172 54L220 29M172 54L220 79M242 29H300M242 79H300" />
-            <circle cx="22" cy="54" r="8" /><circle cx="97" cy="54" r="8" /><circle cx="161" cy="54" r="11" /><rect x="220" y="18" width="25" height="21" rx="2" /><rect x="220" y="68" width="25" height="21" rx="2" /><circle cx="300" cy="29" r="8" /><circle cx="300" cy="79" r="8" />
-          </>
-        )}
-      </svg>
       <div className="thumb-key"><span className="thumb-line" /> <span>reference topology</span></div>
     </div>
   );

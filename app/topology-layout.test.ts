@@ -10,6 +10,7 @@ import {
   connectionGeometry,
   connectionPath,
   frameForNode,
+  thumbnailEdgePath,
   topologyGrids,
 } from './topology-layout.ts';
 
@@ -95,6 +96,31 @@ test('edges dock with orthogonal paths', () => {
       assert.ok(geometry.points.length >= 2);
     }
   }
+});
+
+test('catalogue thumbnails reuse the live orthogonal routes in percent space', () => {
+  for (const architecture of architectures) {
+    const nodes = nodeMapFor(architecture.id);
+    for (const edge of architecture.edges) {
+      const path = thumbnailEdgePath(edge, nodes);
+      assert.equal(path.includes('Q '), false, path);
+      assert.match(path, /^M /);
+      isAxisAligned(path);
+    }
+  }
+});
+
+test('catalogue thumbnail edges stay visible between neighbouring nodes', () => {
+  const architecture = architectures.find((item) => item.id === 'event_driven_checkout');
+  assert.ok(architecture);
+  const nodes = nodeMapFor(architecture.id);
+  const path = thumbnailEdgePath(architecture.edges[0], nodes);
+  const points = [...path.matchAll(/[ML]\s+(-?[\d.]+)\s+(-?[\d.]+)/g)].map((match) => ({
+    x: Number(match[1]),
+    y: Number(match[2]),
+  }));
+  const span = Math.abs(points[0].x - points[points.length - 1].x) + Math.abs(points[0].y - points[points.length - 1].y);
+  assert.ok(span >= 12, path);
 });
 
 test('checkout keeps the request path on one horizon', () => {

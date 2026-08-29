@@ -201,6 +201,23 @@ export function connectionPath(edge: EdgeDefinition, nodes: Map<string, NodeDefi
     .join(' ');
 }
 
+export function thumbnailEdgePath(edge: EdgeDefinition, nodes: Map<string, NodeDefinition>) {
+  const fromNode = nodes.get(edge.from);
+  const toNode = nodes.get(edge.to);
+  if (!fromNode || !toNode) return '';
+  const from = graphPoint(fromNode);
+  const to = graphPoint(toNode);
+  if (almostEqual(from.y, to.y) || almostEqual(from.x, to.x)) {
+    return `M ${from.x.toFixed(1)} ${from.y.toFixed(1)} L ${to.x.toFixed(1)} ${to.y.toFixed(1)}`;
+  }
+  const others = othersFor(edge, nodes);
+  const mids = [0.5, 0.32, 0.68, 0.22, 0.78].map((t) => from.x + (to.x - from.x) * t);
+  const midX = mids.find((x) =>
+    !others.some((node) => Math.abs(node.x - x) < ALIGN_EPS && Math.min(from.y, to.y) - ALIGN_EPS <= node.y && node.y <= Math.max(from.y, to.y) + ALIGN_EPS),
+  ) ?? mids[0];
+  return `M ${from.x.toFixed(1)} ${from.y.toFixed(1)} L ${midX.toFixed(1)} ${from.y.toFixed(1)} L ${midX.toFixed(1)} ${to.y.toFixed(1)} L ${to.x.toFixed(1)} ${to.y.toFixed(1)}`;
+}
+
 export function frameForNode(architectureId: ArchitectureId, node: Pick<NodeDefinition, 'id' | 'x' | 'y' | 'region'>) {
   const grid = topologyGrids[architectureId];
   if (architectureId === 'multi_region_saas') {
