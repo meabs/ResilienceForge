@@ -65,7 +65,7 @@ Open `http://localhost:3000/`. For the intended interaction, load a reference, r
 
 ### WebMCP-enabled browser
 
-Open the live URL in ChatGPT desktop's in-app browser with WebMCP enabled. Wait for `get_webmcp_status.toolsReady === true` or `html[data-webmcp-ready="true"]`. Call `list_architectures`, then `load_architecture` with `checkout`, `saas`, or `llm`. Call `get_bench_guide` and `get_bench_snapshot`, run the distinctive stress, begin a legal remediation, and change Peak RPS, Primary traffic, or New model traffic from the UI. Confirm the agent receives `STALE_STATE`, sees the human `ui` entry in `get_decision_log`, re-reads the snapshot, and succeeds with the new version. Verify a hard pin remains enforced.
+Open the live URL in ChatGPT desktop's in-app browser and wait for the SITE TOOLS lamp to turn green. Follow the plain-language **Recommended judge walkthrough** at the top of `README.md`: load Event-driven checkout, paste the supplied prompt, move the visible Peak load slider when asked, and enable the visible ordering pin when asked. The agent discovers the site actions itself; judges do not need tool names. Confirm the graph, gauges and Flight Data Recorder show the human change, rejected stale action, semantic re-read, revised remediation, SLO recovery and separately enforced pin.
 
 Standard Chrome without the WebMCP runtime is expected to show amber and still supports the visible app. The final live host check must be performed manually in the judge-compatible browser.
 
@@ -114,7 +114,7 @@ The final code review found and fixed a readiness edge case: when a host exposes
 
 - The simulation is deterministic and intentionally educational; it is not a production sizing or resilience guarantee.
 - The live judge path depends on a browser/client with WebMCP enabled. The app correctly remains usable without that runtime.
-- The current browser automation environment verified the live HTTPS page, green SITE TOOLS status, 37/37 catalog count, and no console errors, but could not invoke the host's WebMCP command because that automation model did not expose its `webmcp_list_tools` command. Treat the external tool-call path as a required manual final check, not as an automated pass.
+- A live ChatGPT in-app-browser check verified the HTTPS page, green SITE TOOLS status, 37/37 catalogue count, no console errors, architecture loading, stress, `STALE_STATE`, decision-log readback, revised remediation, SLO recovery and reset. Repeat the README walkthrough after the final deploy because the deployed build must match the final repository commit.
 - The submitter must confirm eligibility, country, submitter type, app status, clients tested, AI tools, learning level, career value, and the YouTube URL.
 - The submitter must not edit the live project after the submission deadline.
 
@@ -130,7 +130,7 @@ Complete these in Devpost; do not leave the placeholders in the final form.
 | App Status | Likely New for this repository; confirm. Select Existing if the app was built before the challenge and use the explanation below. |
 | Existing-app explanation | TODO if Existing: identify what existed before 25 Aug 2026 and describe the meaningful WebMCP extension after that date with dated public evidence. |
 | Live URL | `https://resilience-forge.gman72.chatgpt.site/` |
-| Testing instructions | Use the WebMCP-enabled-browser steps above; mention that standard Chrome intentionally shows amber. |
+| Testing instructions | Use the plain-language README walkthrough. Chrome without WebMCP enabled shows amber; ChatGPT's in-app browser or WebMCP-enabled Chrome should show green. |
 | Public code repository | `https://github.com/meabs/ResilienceForge` |
 | AI agent/client tested | TODO: list the actual WebMCP-enabled clients you personally tested, such as ChatGPT desktop in-app browser or WebMCP-enabled Chrome. |
 | AI tools leveraged | TODO: list the tools actually used in development, such as Codex, Cursor, and any other tools; remove anything not used. |

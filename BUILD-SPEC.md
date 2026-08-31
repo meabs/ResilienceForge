@@ -1,10 +1,12 @@
 # Resilience Forge — Agent Build Specification v3.1
 
-**Status:** Source of truth for the build — competition-fit hardened  
+**Status:** Historical v3.1 planning brief — not the exact shipped interface contract
 **Contest:** OpenAI WebMCP Challenge  
 **Submission deadline used by this spec:** 3 September 2026, 21:00 Europe/London (Devpost official rules currently state 1:00pm PDT). Recheck the Devpost countdown before submission because the OpenAI landing page currently shows a different time.  
 **Companion documents:** `SCREEN-FLOWS.md`, `TEST-ACCEPTANCE.md`  
 **Design inputs:** mockups in `mockups/` define layout and tone, not pixels.
+
+> **Implementation note (2026-09-01):** The shipped project evolved from this early AWS/SQS-oriented brief to the GCP implementation documented in `README.md`, `PRODUCT.md`, and `TEST-ACCEPTANCE.md`. Historical AWS identifiers and examples remain below for design traceability; do not use them as current tool names, regions, provider claims, or judge instructions. The application source and current acceptance tests define the implemented GCP/Pub/Sub, Cloud Run, Cloud SQL, and Vertex AI behavior.
 
 > **Non-negotiable:** `event_driven_checkout`, `multi_region_saas`, and `llm_inference_serving` are first-class product scenarios. All three must load, simulate, fail in a distinct way, accept human intervention, expose appropriate WebMCP tools, recover through legal moves, and satisfy their acceptance tests. Do not remove or visually demote a scenario to save time.
 

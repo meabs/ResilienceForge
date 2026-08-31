@@ -15,7 +15,7 @@ All three scenarios are first-class. A release candidate fails if any scenario l
 | CORE-07 | Refresh same command sequence | Same metrics/tick path |
 | CORE-08 | FDR | UI and WebMCP operations present, newest last |
 | CORE-09 | Reduced motion | No loss of state information |
-| CORE-10 | No hidden second store | React Flow reflects domain store only |
+| CORE-10 | No hidden second store | Topology canvas reflects domain store only |
 | CORE-11 | Human uses ordinary control during agent activity | Control stays enabled, version increments, next tick reflects change |
 | CORE-12 | Semantic WebMCP read | Metrics expose demand/capacity/utilisation/headroom plus scenario-specific queue/TTFT values |
 | CORE-13 | Constraint provenance | `get_constraints` exposes sourceType/sourceDate/source URL where applicable |
@@ -25,10 +25,10 @@ All three scenarios are first-class. A release candidate fails if any scenario l
 
 | ID | Test | Expected |
 |---|---|---|
-| CO-01 | 10k RPS, FIFO standard, batch 1 | Queue bottleneck; SLO fails |
-| CO-02 | Enable high throughput only | Capacity improves but remains below 10k unbatched |
-| CO-03 | High throughput + sufficient batching | Queue capacity exceeds 10k and jam clears |
-| CO-04 | Keep FIFO ordering pin | Unordered replacement is rejected |
+| CO-01 | 10k RPS, one ordered Pub/Sub key, batch 1 | Queue bottleneck; SLO fails |
+| CO-02 | Increase ordering-key parallelism only | Capacity improves but remains below 10k unbatched |
+| CO-03 | Ordered-key parallelism + sufficient batching | Queue capacity exceeds 10k and jam clears |
+| CO-04 | Keep Pub/Sub ordering keys pin | Unordered replacement is rejected |
 | CO-05 | Human changes peak RPS/budget during agent change | stale mutation rejected; semantic re-read; revised remediation succeeds |
 | CO-06 | Fail zone containing primary DB | DB runtime health down and synchronous path degrades |
 | CO-07 | Same-region replica legal | no-second-region pin does not block it |
@@ -39,7 +39,7 @@ All three scenarios are first-class. A release candidate fails if any scenario l
 | ID | Test | Expected |
 |---|---|---|
 | MR-01 | Healthy 50/50 split | both regions visibly receive traffic |
-| MR-02 | Fail us-east-1 | region B down; traffic allocated there is lost |
+| MR-02 | Fail us-east4 | region B down; traffic allocated there is lost |
 | MR-03 | Shift to primary without scaling | surviving region can become saturated |
 | MR-04 | Shift + autoscale primary | target can recover within model |
 | MR-05 | Human changes primary traffic allocation mid-agent action | packets reflow, stale agent action rejected, agent adapts |
@@ -89,8 +89,8 @@ The full site tool set stays registered across Catalogue and every Bench. Irrele
 - UI always says **public list-price estimate**.
 - Every limit is `provider_limit` or `model_assumption`.
 - Provider limit records include source URL/date.
-- Model assumptions never masquerade as AWS service guarantees.
-- Checkout FIFO London snapshot reflects the curated values documented in `limits.json`.
+- Model assumptions never masquerade as GCP service guarantees.
+- Checkout ordered Pub/Sub constraints match the curated records returned by `get_constraints` and defined in `app/data.ts` / `app/resilience-forge.tsx`.
 
 # 7. Video acceptance
 

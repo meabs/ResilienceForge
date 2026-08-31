@@ -11,30 +11,50 @@ Resilience Forge is a shared human-and-browser-agent operations bench for testin
 
 ## Judge prompt
 
-Open the live URL in **ChatGPT desktop’s in-app browser** (SITE TOOLS must be green). Standard Chrome stays amber. From the Catalogue, the agent can `list_architectures` and `load_architecture` onto the bench. On the Bench, pins and ordinary controls stay human-owned.
+Open the live URL in **ChatGPT desktop’s in-app browser** and wait for **SITE TOOLS** to turn green. Chrome also works when WebMCP testing is enabled. The agent discovers the available actions from the site, so judges do not need to know or type any tool names.
 
-Paste on the Catalogue or after a reference is loaded:
+### Recommended judge walkthrough
+
+#### 1. Open the bench
+
+1. Open the live project and wait for the **SITE TOOLS** lamp in the top-right area to turn green and say **LIVE**.
+2. The Catalogue shows three equal architecture cards. On **Event-driven checkout**, click **Load onto bench**.
+3. On the Bench, the architecture graph is the large canvas. The gauges run across the top, the human controls and constraints are in the right-hand rail, and the **Flight Data Recorder** is the strip along the bottom.
+
+#### 2. Paste this prompt
+
+The agent discovers and uses the site's capabilities itself:
 
 ```
-You are on Resilience Forge. Wait until get_webmcp_status.toolsReady is true, or html[data-webmcp-ready]=true.
+Act as an architecture reviewer working with me on this live Resilience Forge bench. Discover and use the site's available actions yourself; do not ask me for tool names or technical commands.
 
-If you are on the Catalogue, call list_architectures, then load_architecture with checkout, saas, or llm. Site tools stay registered. Then call get_bench_guide and get_bench_snapshot.
+First, inspect the loaded architecture and briefly explain its topology, workload, service targets, cost, human constraints, and the most important demand, capacity, utilisation, headroom, queue, and provenance evidence available to you. Distinguish provider limits from simulation assumptions, and do not claim this model proves production resilience.
 
-1. Call get_bench_guide, then get_bench_snapshot.
-2. Run the distinctive stress for this reference.
-3. Start a legal remediation using expectedVersion from the snapshot.
-4. I will change an ordinary live control (peak load, region split, or model split) while you work.
-5. When you get STALE_STATE, call get_decision_log, then get_bench_snapshot, then retry with the new expectedVersion.
-6. Do not violate pinned human constraints. keep_pubsub_ordering blocks unordered Pub/Sub replacement; a same-region add_read_replica stays legal.
+Run the characteristic stress test. Diagnose the failure from live evidence and prepare a complete, legal remediation. Explain the proposed changes and their capacity, latency, ordering, and cost trade-offs, but do not apply them yet. Tell me **CHANGE PEAK LOAD NOW** and wait.
 
-Narrate what changed in the graph, gauges, and FDR.
+After I reply **continue**, first attempt the exact plan you prepared from the earlier state without silently refreshing it. The site should protect my newer decision by rejecting that stale action. Then inspect the audit trail and current state, explain what I changed, revise the remediation for the latest workload, and apply the revised plan safely. Verify the result against the service targets and compare before and after.
+
+Next, tell me **ENABLE THE ORDERING PIN NOW** and wait. After I reply **pinned**, test an incompatible unordered shortcut so the site visibly rejects it without changing the architecture. Then show that a legal ordered alternative remains available. Do not bypass the pin.
+
+Throughout the walkthrough, narrate what changes in the graph, gauges, root-cause panel, and Flight Data Recorder. Finish by explaining why semantic site access, stale-state protection, atomic remediation, and hard human constraints make this safer than an agent clicking through a dashboard. Briefly describe the distinct regional-failure and LLM-serving investigations available in the other two references.
 ```
 
-Then change Peak load (or Primary traffic / New model traffic) while the agent is operating. Confirm FDR shows `ui` then `webmcp` `STALE_STATE`, then a successful retry.
+#### 3. Make the two human changes
+
+The agent will pause twice. Leave the page open while making these changes:
+
+1. When it says **CHANGE PEAK LOAD NOW**, find **Live controls** at the top of the right-hand rail. Move the **Peak load** slider from 10,000 to 12,000 req/s, then reply **continue** in ChatGPT. Watch the bottom Flight Data Recorder record the human change, the rejected stale agent action, the semantic re-read, and the successful revised remediation.
+2. When it says **ENABLE THE ORDERING PIN NOW**, find **Human pins** immediately below Live controls. Click **Keep Pub/Sub ordering keys** until its state reads **ON**, then reply **pinned**. Watch for the incompatible agent action to be rejected while the graph and human setting remain unchanged.
+
+The gauges should finish with full availability, recovered throughput and a passing SLO. If the walkthrough needs a clean restart, click **Reset scenario** near the top of the right-hand rail and reload the reference before trying again.
+
+This path demonstrates semantic architecture evidence, provider provenance, distinctive failure, root-cause analysis, plan trade-offs, an ordinary human interruption, stale-state protection, audit-driven recovery, atomic remediation, visible causality, SLO recovery, and separately enforced hard constraints—without requiring the judge to know the underlying API.
+
+For a shorter check, paste: “Stress this loaded reference, explain the failure from live evidence, fix it safely, and show me what changed.”
 
 The build follows the project documents in this repository:
 
-- [BUILD-SPEC.md](./BUILD-SPEC.md) — agent build specification and competition demo script
+- [BUILD-SPEC.md](./BUILD-SPEC.md) — historical v3.1 planning brief; current GCP behavior is defined by the code and acceptance tests
 - [TEST-ACCEPTANCE.md](./TEST-ACCEPTANCE.md) — acceptance criteria and video checklist
 - [PRODUCT.md](./PRODUCT.md) — product definition and positioning
 - [docs/](./docs/) — hero screenshots for judges and Devpost gallery
@@ -89,13 +109,15 @@ The submission draft is intentionally separate from the form: replace its TODO f
 
 ## WebMCP implementation
 
-The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). The full site tool set registers once per document against a page-lifetime AbortSignal. Catalogue and Bench share that set; `load_architecture` is a same-document navigation and does not re-register. `ready` / `toolsReady` is set only after `registerTool`/`registerTools` finishes **and** `getTools()` lists every expected name (or `toolchange` reports the full catalog). Agents should wait for `html[data-webmcp-ready]=true`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady` once after first paint. `html[data-webmcp-capability]` is written on first paint so hosts can see support before discovery.
+The browser-facing integration is in [`app/webmcp.ts`](./app/webmcp.ts). The full site tool set registers once per document against a page-lifetime `AbortSignal`. Catalogue and Bench share that set; `load_architecture` is a same-document navigation and does not re-register. Registration must finish before `ready` / `toolsReady` becomes true. When the host exposes catalogue discovery, readiness also waits until `getTools()` lists every expected name, either by polling or after a `toolchange` event. Hosts without catalogue discovery use successful registration as the readiness boundary. Agents can wait for `html[data-webmcp-ready="true"]`, the `webmcp-tools-ready` event, or `get_webmcp_status.toolsReady`. `html[data-webmcp-capability]` is published before discovery completes so hosts can distinguish support from readiness.
 
-Each `tool` contains `name`, `title`, `description`, `inputSchema`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`), and `execute`. `execute` honors an AbortSignal as its second argument and returns `ABORTED` if cancelled before it runs. Live handlers are rebound across tab remounts so the session can continue without rediscovery when the same architecture is still loaded.
+Each tool contains `name`, `title`, `description`, a complete object `inputSchema`, annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, plus `untrustedContentHint` on RCA), and `execute`. The second `execute` argument is an extras object; when `extras.signal` is already aborted, execution returns `ABORTED` before calling the domain handler. Live handlers rebind across Catalogue/Bench route transitions and React view remounts inside the same document, so the registered catalogue is reused while the visible reference changes. Separate browser tabs have separate documents and sessions.
 
-`get_decision_log` is the agent-readable Flight Data Recorder. After `STALE_STATE`, the agent can see the human `ui` operation that moved the version without scraping the ticker. Mutating tools return `{ before, after }` availability / SLO snapshots. The FDR ticker shows the last 30 operator events, is copyable, and flashes on `STALE_STATE`.
+`get_decision_log` is the agent-readable Flight Data Recorder. After `STALE_STATE`, the agent can see the human `ui` operation that moved the version without scraping the ticker. Successful mutations return `{ before, after }` availability/SLO snapshots; rejected stale or pinned actions return structured rejection data without changing state. The FDR ticker shows the last 30 operator events, is copyable, and flashes on `STALE_STATE`.
 
 ### Common tools (all architectures)
+
+The following snippets are abridged interface examples, not copyable source. The real registrations add titles, annotations, complete JSON Schemas, required fields, enums, bounds, compatibility aliases, and wrapped cancellation handling in [`app/resilience-forge.tsx`](./app/resilience-forge.tsx).
 
 ```ts
 document.modelContext.registerTool({ name: 'get_webmcp_status', description: 'Read WebMCP capability, toolsReady, session id, and registered tool names.', inputSchema: {}, execute: async (input) => read('get_webmcp_status', input) });

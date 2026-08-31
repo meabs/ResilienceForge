@@ -38,9 +38,9 @@ Pins are a second joint move: `keep_pubsub_ordering` blocks unordered replacemen
 
 ## How WebMCP is implemented
 
-- Imperative `document.modelContext.registerTool` / `registerTools` once per document. Catalogue and Bench share the same site tool set (`sessionId` `resilience-forge`).
+- Imperative `document.modelContext.registerTool` / `registerTools` once per document. Catalogue and Bench share the same site tool set; each document receives a short generated session ID.
 - Page-lifetime `AbortController`. Changing view or architecture rebinds live handlers. It does not unregister tools or wait for a second `toolsReady`.
-- Ready handshake: `getTools()` must list every expected name (or `toolchange`) before `html[data-webmcp-ready]=true`. After first paint, `get_webmcp_status.toolsReady` stays true across `load_architecture`.
+- Ready handshake: registration must finish first. When the host exposes `getTools()`, every expected name must be discoverable—by polling or `toolchange`—before `html[data-webmcp-ready]=true`. Hosts without catalogue discovery use completed registration as the readiness boundary. Readiness stays true across same-document architecture changes.
 - Architecture-specific mutations stay listed. Illegal ones return `ILLEGAL_MOVE`, `UNKNOWN_NODE`, or `NO_BENCH_LOADED`.
 - Annotations: `readOnlyHint`, `destructiveHint`, `idempotentHint`, plus `untrustedContentHint` on RCA. Each tool has a `title`.
 - `execute` takes `{ signal }` and returns `ABORTED` if cancelled before it runs.

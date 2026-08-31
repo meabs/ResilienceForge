@@ -42,7 +42,7 @@ Resilience Forge. The supplied brief defines the product voice as precise, calm,
 
 ## Evidence on Hand
 
-The repository contains BUILD-SPEC.md, SCREEN-FLOWS.md, TEST-ACCEPTANCE.md, and the expanded Resilience_Forge_Build_Documentation_v3_1.docx. These are the source of truth for product behavior. No production customer data, testimonials, or brand assets are available; the UI must use clearly synthetic demonstration values.
+The repository contains the historical v3.1 planning brief in BUILD-SPEC.md, plus SCREEN-FLOWS.md and the current TEST-ACCEPTANCE.md. The shipped GCP behavior is defined by the application code and current acceptance tests; the older planning brief retains some pre-implementation AWS vocabulary for traceability and is not an exact interface contract. No production customer data, testimonials, or brand assets are available; the UI uses clearly synthetic demonstration values.
 
 ## Product Principles
 
